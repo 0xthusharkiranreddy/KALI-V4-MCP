@@ -330,6 +330,11 @@ for r in rows:
 /pt-oauth <target-url>                → OAuth 2.0 / SAML / SSO: redirect_uri bypass, state CSRF, PKCE downgrade, SAML signature wrapping, OIDC confusion
 /pt-race <target-url> [token]         → race conditions: single-packet attack (HTTP/2), limit overrun, 2FA OTP race, email uniqueness race, coupon stacking
 /pt-client <target-url>               → client-side: DOM XSS (sources→sinks), postMessage hijack, CSTI (Angular/Vue), clickjacking, DOM clobbering
+/pt-net <interface|subnet>            → network discovery: ARP sweep, masscan+nmap, service fingerprint, vuln correlation, signal-driven attack plan
+/pt-exploit <target-ip> [service]     → service exploitation: CVE triage, Metasploit, default creds, EternalBlue/Log4Shell/Hikvision/BlueKeep, post-exploit pivot
+/pt-mitm <interface> [target] [gw]   → network MITM: ARP poison, DNS spoof, SSL strip, responder, NTLM relay → shell, IPv6 MITM (mitm6)
+/pt-wifi [interface]                  → WiFi attacks: monitor mode, airodump survey, WPA2 handshake+PMKID, hashcat crack, WPS Pixie Dust, evil twin AP
+/pt-iot <subnet|host>                 → IoT/camera/router: MAC OUI classify, RTSP streams, default creds (Hikvision/Dahua/Cisco/MikroTik), CVE exploit, SNMP dump
 /pt-privesc <user@ip>                 → Linux privilege escalation: linpeas + 10-phase survey
 /pt-ad <domain> <dc-ip> [creds]       → Active Directory: AS-REP → Kerberoast → BloodHound → DCSync
 /pt-report [engagement-name]          → professional pentest report with CVSS + compliance mapping
@@ -374,6 +379,29 @@ Engine-specific: Thymeleaf payloads differ from Jinja2 differ from Twig.
 OOB (out-of-band) blind vulnerability detection using interactsh as callback server.
 Phases: interactsh session setup → blind SSRF (GET/POST params + headers) → blind SQLi (sqlmap with `--dns-domain`) → blind command injection (nslookup/curl payloads into all params) → blind XXE (SVG/XML file upload) → SSTI blind math probes → callback verification.
 Confirms exploitability even when target response is identical for all inputs.
+
+### `/pt-net <interface|subnet>`
+Network discovery and signal-driven infrastructure attack planner — the `/pt` equivalent for networks.
+Phases: interface detection (ip link, iw dev, auto-detect subnet) → ARP sweep (arp-scan + netdiscover, MAC OUI vendor lookup) → masscan full 65535-port scan → nmap service+OS fingerprinting (-sV -sC -O) → vuln correlation (nmap --script vuln + nuclei CVE templates + searchsploit per version) → admin portal discovery (all management ports) → protocol enumeration (SMB/SNMP/FTP/SMTP/VNC/RDP/RTSP/Telnet/SSH) → signal table with prioritized next-skill recommendations.
+Output: live host list, service map, known vulnerabilities, admin portals, and "run /pt-exploit / /pt-mitm / /pt-wifi / /pt-iot" recommendations.
+
+### `/pt-exploit <target-ip> [service:port:version]`
+Service exploitation engine — given a host+service from `/pt-net`, systematically exploit it.
+Phases: CVE triage (searchsploit + msfconsole search + nuclei CVE templates) → Metasploit auto-exploit (check + exploit for ranked modules) → default credential sweep (hydra on SSH/FTP/HTTP/Telnet/RDP/VNC/SMB) → admin portal bruteforce → hardcoded high-value CVE attempts: EternalBlue MS17-010 (SMB), BlueKeep CVE-2019-0708 (RDP), Log4Shell CVE-2021-44228 (JNDI in HTTP headers), Spring4Shell CVE-2022-22965, ProxyShell CVE-2021-34473, PrintNightmare CVE-2021-1675, Hikvision RCE CVE-2021-36260, Dahua auth bypass CVE-2021-33044, MikroTik Winbox CVE-2018-14847, Cisco Smart Install CVE-2018-0171 → post-exploitation (shell upgrade, credential dump, pivot setup, credential spray across subnet).
+
+### `/pt-mitm <interface> [target-ip] [gateway-ip]`
+Full network man-in-the-middle attack chain — ARP position → credential capture → NTLM relay → shell.
+Phases: IP forwarding setup → passive network sniff (identify protocols, plain-text creds) → ARP poisoning (bettercap fullduplex between target and gateway) → DNS spoofing (redirect internal domains to Kali) → SSL stripping (HTTPS downgrade via hstshijack/sslstrip) → credential sniffing (FTP/HTTP/SMTP/POP3/IMAP/Telnet auto-capture) → Responder LLMNR/NBT-NS/MDNS poisoning (NTLMv2 hash capture from all Windows hosts) → NTLM relay (ntlmrelayx → secretsdump or shell without cracking) → IPv6 MITM (mitm6 + DHCPv6 → bypasses LLMNR defenses on patched networks) → WPAD proxy injection → hash cracking (hashcat -m 5600).
+Key: Responder + NTLM relay = domain credentials without cracking; IPv6 MITM bypasses hardened networks.
+
+### `/pt-wifi [interface]`
+Full WiFi attack chain from interface detection to cracked PSK to client compromise.
+Phases: interface detection + monitor mode (airmon-ng, kill NetworkManager) → airodump-ng survey (all 2.4GHz + 5GHz networks, BSSID/channel/signal/encryption/clients) → target selection → PMKID attack (hcxdumptool — passive, no deauth, no clients needed) → WPA2 handshake capture (airodump-ng + aireplay-ng deauth) → hashcat cracking (mode 22000, rockyou + best64 rules + ESSID-based wordlist) → WPS Pixie Dust (wash + reaver) → evil twin AP (hostapd + DHCP + captive portal) → client deauth + KARMA attack → WEP cracking (ARP replay + aircrack-ng).
+After PSK cracked → connect → /pt-net → /pt-mitm → own entire network.
+
+### `/pt-iot <subnet|host>`
+IoT, IP camera, router, and printer discovery and exploitation with brand-specific CVE awareness.
+Phases: device discovery (arp-scan + MAC OUI vendor classification) → port-based device classification (RTSP 554 = camera, 37777 = Dahua, 8000 = Hikvision, 9100 = printer, 8291 = MikroTik, 23 = Telnet) → RTSP stream enumeration (nmap rtsp-url-brute + ffprobe URI testing with brand defaults) → default credential sweep (hydra with brand-specific creds: Hikvision/Dahua/Axis/Hanwha/Cisco/MikroTik/Ubiquiti/NETGEAR/TP-Link/Asus/D-Link/printers) → CVE exploitation: Hikvision RCE CVE-2021-36260 (unauthenticated `/SDK/webLanguage`), Dahua auth bypass CVE-2021-33044 (SOAP magic hash), MikroTik Winbox CVE-2018-14847 (credential extraction), NETGEAR CVE-2017-5521 (password recovery), Cisco Smart Install CVE-2018-0171 → SNMP full config dump (snmpwalk with community string brute, extracts WiFi PSK/VLANs/routing) → routersploit automated scanning → post-compromise pivot (map camera VLAN, extract stored creds, firmware analysis).
 
 ### `/pt-privesc <user@ip>`
 10-phase Linux privilege escalation from low-privilege foothold to root.
@@ -467,8 +495,27 @@ EOF
 | netexec | 1.5.1 | SMB/WinRM/LDAP enum |
 | responder | 3.2.2 | LLMNR/NBT-NS poisoning |
 | enum4linux | 0.9.1 | Windows/Samba enum |
-| python3-impacket | 0.13.0 | Network protocol library |
+| python3-impacket | 0.13.0 | Network protocol library (includes ntlmrelayx.py) |
 | netcat-traditional | 1.10 | TCP/IP swiss army knife |
+| arp-scan | latest | ARP-based local network discovery with MAC vendor OUI |
+| netdiscover | latest | Passive/active ARP scanning for live host discovery |
+| bettercap | latest | Network MITM framework — ARP/DNS spoof, credential sniff, SSL strip |
+| snmpwalk | latest | SNMP MIB walker — full device config dump via community strings |
+| onesixtyone | latest | SNMP community string brute-force |
+| mitmproxy | latest | HTTP/HTTPS proxy for traffic inspection (MITM) |
+| sslstrip | latest | HTTPS to HTTP downgrade (SSL stripping) |
+| routersploit | latest | Router/IoT exploitation framework — `/opt/routersploit/` |
+| mitm6 | latest | IPv6 MITM via DHCPv6 — bypasses LLMNR defenses (pip3 install mitm6) |
+
+### WiFi
+| Tool | Version | Purpose |
+|------|---------|---------|
+| aircrack-ng | latest | WEP/WPA cracking suite (aircrack-ng, airmon-ng, airodump-ng, aireplay-ng) |
+| hcxdumptool | latest | WiFi PMKID capture — passive, no deauth required |
+| hcxtools | latest | Convert hcxdumptool captures to hashcat format (hcxpcapngtool) |
+| reaver | latest | WPS PIN brute force + Pixie Dust attack |
+| wash | latest | WPS-enabled network scanner |
+| hostapd-wpe | latest | Evil twin AP with credential harvesting (install: apt install hostapd-wpe) |
 
 ### Password Attacks
 | Tool | Purpose |
