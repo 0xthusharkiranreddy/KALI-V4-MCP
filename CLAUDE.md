@@ -325,8 +325,11 @@ for r in rows:
 /pt-payloads <tech, input, endpoint>  → targeted payload generator from PAT
 /pt-blind <target-url>                → OOB blind detection (SSRF, SQLi, CMDi, XXE) via interactsh
 /pt-secrets <target-url>              → leaked API keys, .git exposure, .env files, cloud buckets, key validation (AWS/Stripe/GCP/OpenAI)
-/pt-web <target-url>                  → HTTP request smuggling, web cache poisoning, subdomain takeover, WebSockets, CRLF
-/pt-logic <api-base-url> [token]      → business logic + IDOR expert: data model mapping, price manipulation, workflow bypass, mass assignment
+/pt-web <target-url>                  → HTTP request smuggling, web cache poisoning, subdomain takeover, WebSockets, CRLF, host header, file upload
+/pt-logic <api-base-url> [token]      → business logic + IDOR expert: data model mapping, price manipulation, workflow bypass, mass assignment, 2FA bypass
+/pt-oauth <target-url>                → OAuth 2.0 / SAML / SSO: redirect_uri bypass, state CSRF, PKCE downgrade, SAML signature wrapping, OIDC confusion
+/pt-race <target-url> [token]         → race conditions: single-packet attack (HTTP/2), limit overrun, 2FA OTP race, email uniqueness race, coupon stacking
+/pt-client <target-url>               → client-side: DOM XSS (sources→sinks), postMessage hijack, CSTI (Angular/Vue), clickjacking, DOM clobbering
 /pt-privesc <user@ip>                 → Linux privilege escalation: linpeas + 10-phase survey
 /pt-ad <domain> <dc-ip> [creds]       → Active Directory: AS-REP → Kerberoast → BloodHound → DCSync
 /pt-report [engagement-name]          → professional pentest report with CVSS + compliance mapping
@@ -386,6 +389,22 @@ Saves all hashes to `/home/kali/current/loot/hashes/` and report to `/home/kali/
 Reads all engagement artifacts (engagement.md, PoC files, recon data) and generates a professional penetration test report.
 Includes: executive summary (business language), risk summary table, CVSS v3.1 scored findings with vector strings, CWE references, OWASP/PCI-DSS/GDPR compliance mapping table, specific remediation (not generic), attack chain documentation, coverage table (tested-but-not-vulnerable), remediation priority matrix.
 Saves to `/home/kali/current/notes/pentest_report_YYYY-MM-DD.md`.
+
+### `/pt-oauth <target-url>`
+7-phase OAuth 2.0 / SAML / OIDC attack suite.
+Phases: discovery (OIDC metadata, JWKS, SAML metadata) → redirect_uri bypass (path traversal, subdomain, regex bypass, @-injection) → state CSRF (absent/predictable state param) → authorization code replay/injection → PKCE downgrade (no code_challenge enforced) → SAML attacks (signature wrapping/XMLWrapping, replay attack, NameID manipulation, XXE in SAML response) → OIDC token confusion (ID token as access token, aud claim not validated, RS256→HS256 confusion) → scope escalation + client credentials as user → token leakage (Referer, implicit flow fragment, postMessage).
+Key: redirect_uri bypass + open redirect on callback = code theft via Referer chain (high-value bug bounty finding).
+
+### `/pt-race <target-url> [token]`
+8-phase race condition attack suite using the 2023 single-packet technique.
+Core technique: Python httpx with HTTP/2 — bundles all parallel requests into a single TCP packet, eliminating network jitter and making race windows deterministic (<1ms vs 50-100ms with curl &).
+Phases: endpoint discovery → limit overrun (coupon/balance/points via HTTP/2 parallel) → email uniqueness race (two accounts same email) → 2FA OTP race (same OTP accepted twice before marked used) → password reset token race (two valid tokens simultaneously) → session upgrade race (MFA + privileged access in same packet window) → withdrawal/transfer overrun → coupon stacking race.
+Uses `httpx` async Python with HTTP/2 + connection warming. Falls back to parallel curl for HTTP/1.1 targets.
+
+### `/pt-client <target-url>`
+7-phase client-side attack suite covering the browser/JavaScript attack surface (absent from server-side scanners).
+Phases: framework detection (React/Angular/Vue from DOM + response headers) → DOM XSS source/sink analysis (grep innerHTML/eval/document.write sinks vs location.hash/referrer/postMessage sources in JS bundles) → postMessage vulnerabilities (origin check absent → cross-origin XSS/CSRF/data theft, window.opener tabnagging) → CSTI (Angular 1.x: `{{constructor.constructor('alert(1)')()}}`, Vue: `{{_c.constructor(...)()}}`, React dangerouslySetInnerHTML) → DOM clobbering (HTML injection overriding getElementById results, form id/name collisions) → prototype pollution via URL (`?__proto__[isAdmin]=true`, `?constructor[prototype][role]=admin`) → clickjacking (X-Frame-Options / frame-ancestors CSP absent on sensitive actions).
+Uses Playwright browser (`mcp__kali-desktop__browser_*`) for live DOM inspection alongside static JS analysis.
 
 ### `/pt-secrets <target-url>`
 7-phase leaked secrets and API key hunter for exposed credentials and sensitive files.

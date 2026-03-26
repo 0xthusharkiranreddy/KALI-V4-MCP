@@ -80,6 +80,13 @@ Present selected vectors as a numbered list with one-line reasoning before execu
 | OAuth / `redirect_uri` in flow | redirect_uri bypass, state fixation, CSRF on auth callback, implicit flow token leakage | **MEDIUM** |
 | Coupon/redeem/transfer/vote/like endpoint with counter or balance | Race condition: 20 simultaneous identical requests — counter exceeds limit, coupon applied >1x, balance goes negative | **HIGH** |
 | Java stack trace, `.ser` upload accepted, `viewstate` in forms, `X-Java-Serialized-Object` header, pickle/marshal in Python response | Deserialization: ysoserial CommonsCollections1 → OOB DNS callback → confirm RCE; python-deserialization for pickle/yaml/marshal | **HIGH** |
+| OAuth `redirect_uri` parameter visible in flow, `state` parameter absent or predictable, PKCE not used, SAML SSO login present, `/saml/metadata` accessible | OAuth/SAML: redirect_uri bypass (path traversal, subdomain, regex), state CSRF, PKCE downgrade, SAML signature wrapping, OIDC token confusion — run `/pt-oauth` | **CRITICAL** |
+| 2FA/MFA prompt after login, `/api/verify-otp` or `/api/verify-2fa` in traffic | 2FA bypass: pre-MFA session authenticated? OTP brute force rate limit? Response manipulation (flip success:false)? TOTP secret in setup response? OAuth bypass? — run `/pt-logic` Phase 8 | **HIGH** |
+| SPA (React/Angular/Vue), `ng-app` / `data-reactroot` / `__vue__` in DOM, `location.hash` used in JS, `postMessage` / `addEventListener('message')` in JS bundle | Client-side: DOM XSS (sources→sinks), postMessage without origin check, CSTI (Angular `{{constructor.constructor('alert(1)')()}}`), clickjacking — run `/pt-client` | **HIGH** |
+| Password reset / account recovery flow present | Host header password reset poisoning: inject `Host: attacker.com` on reset request → victim's reset link contains attacker domain — run `/pt-web` Phase 6 | **HIGH** |
+| `__proto__` / `constructor.prototype` key accepted in JSON, `lodash.merge`/`Object.assign` in JS bundle, Node.js backend | Server-side prototype pollution: `{"__proto__":{"isAdmin":true}}` → global Object polluted → privilege escalation → RCE via gadget chain | **HIGH** |
+| Concurrent limit-enforced action (coupon, transfer, redeem, vote, OTP), HTTP/2 supported | Race condition (single-packet attack): use httpx HTTP/2 to send N simultaneous requests — bypass limit enforcement — run `/pt-race` | **HIGH** |
+| OAuth OIDC in use, multiple client applications sharing same auth server | Mixed-up receiver: submit token issued for client A to client B API; OIDC `aud` claim not validated | **MEDIUM** |
 | HTTP response has both `Transfer-Encoding: chunked` and `Content-Length` headers, or server accepts TE header variants — load balancer / reverse proxy in front of app | HTTP Request Smuggling: CL.TE / TE.CL — run `/pt-web` for smuggler.py automated detection + manual timing probes | **HIGH** |
 | Response headers change based on `X-Forwarded-Host`, `X-Host`, or `X-Forwarded-Server` — CDN/cache layer present (`X-Cache: HIT`, `Age:` header visible) | Web Cache Poisoning: inject OAST/canary via unkeyed headers, verify second request (without header) returns poisoned response — run `/pt-web` Phase 2 | **HIGH** |
 | Subdomain CNAME resolves to external service (GitHub Pages, S3, Heroku, Netlify, Fastly, Azure, Shopify) | Subdomain Takeover: check if the external service account is unclaimed → register it → serve content on subdomain — run `/pt-web` Phase 3 | **HIGH** |
@@ -841,6 +848,20 @@ Before final documentation, check if any confirmed findings can be chained:
 | SSRF + cloud metadata | Read IAM creds from 169.254.169.254 → AWS/GCP API calls | Cloud account takeover |
 | SQLi + weak hashes | Dump password hashes → crack with hashcat | Credential compromise |
 | Error disclosure (DB type) + input param | Targeted SQLi with confirmed DB engine | More efficient exploitation |
+| OAuth redirect_uri bypass + implicit flow | Steal authorization code/token via redirect to attacker domain → exchange for full session | Account takeover without credentials |
+| OAuth state CSRF + IDOR | Force victim to link attacker's OAuth account → IDOR with victim's session → access their data | Full victim account control |
+| SAML NameID manipulation + mass assignment | Set NameID to admin email → login as admin → inject `role:superadmin` fields | Admin account takeover |
+| 2FA response manipulation + race condition | Race two simultaneous POST /verify-otp → one bypasses check → both get authenticated session | MFA bypass → account takeover |
+| Race condition (limit overrun) + coupon/balance | 30 simultaneous redeem requests → balance goes negative / coupon applied 25× | Financial fraud |
+| DOM XSS + CORS misconfiguration | DOM XSS in SPA exfiltrates CORS-readable API response containing auth tokens | Token theft → account takeover |
+| postMessage without origin check + CSRF | Attacker page sends `postMessage` triggering state-changing action (payment, email change) | CSRF without token requirement |
+| Prototype pollution (server-side) + template engine | Pollute `__proto__` → template engine picks up property → RCE via gadget chain | Remote code execution |
+| Host header password reset + open mail relay | Inject `Host: attacker.com` → victim's reset link = attacker domain → steal token | Account takeover |
+| SSRF + Gopher protocol | SSRF → `gopher://127.0.0.1:6379/` → Redis RESP commands → write webshell to disk | RCE via SSRF pivot |
+| Subdomain takeover + CORS | Claim dangling subdomain (*.target.com) → CORS allows it → read all authenticated API responses | Full data exfiltration |
+| CSTI (Angular/Vue) + XSS stored | Angular expression in stored profile field → every viewer executes JS | Stored XSS to account takeover |
+| JWT kid path traversal + SSRF | `kid: "../../dev/null"` → sign with empty secret → also kid pointed at SSRF-reachable server for JWKS | JWT forgery |
+| Broken auth (pre-MFA session) + IDOR | App issues full session cookie after password check, before MFA → use that cookie for IDOR scan | Authenticated IDOR without MFA |
 
 Document chains as a single critical finding combining the individual CVSSes.
 

