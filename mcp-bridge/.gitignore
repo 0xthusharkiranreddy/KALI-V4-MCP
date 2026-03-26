@@ -1,0 +1,37 @@
+# Environment variables
+.env
+
+# SSH Keys - NEVER commit these!
+ssh-keys/
+*.pem
+*.key
+id_rsa
+id_ed25519
+id_ecdsa
+
+# Logs
+logs/
+*.log
+
+# Docker
+.docker/
+
+# Node modules (if running bridge locally)
+node_modules/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+temp/
+
+# Audit and engagement logs
+engagement_log.jsonl
+approved_targets.json
+*.jsonl

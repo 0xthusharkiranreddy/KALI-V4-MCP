@@ -1,0 +1,47 @@
+services:
+  mcp-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    container_name: mcp-bridge
+    ports:
+      - "${PORT:-3001}:3001"
+    volumes:
+      - ./ssh-keys:/mnt/host-keys:ro
+      - ./bridge-server.js:/app/bridge-server.js:ro
+    environment:
+      - PORT=${PORT:-3001}
+      - KALI_USERNAME=${KALI_USERNAME}
+      - KALI_HOST=${KALI_HOST}
+      - KALI_PORT=${KALI_PORT:-22}
+      - COMMAND_TIMEOUT=${COMMAND_TIMEOUT:-3600000}
+      - SSH_POOL_SIZE=${SSH_POOL_SIZE:-5}
+    restart: unless-stopped
+    networks:
+      - mcp-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # desktop-bridge now runs natively on Windows (not Docker) so VBoxManage.exe
+  # is accessible for zero-freeze screenshots. Start it with:
+  #   $env:KALI_HOST="..."; $env:KALI_PORT="22"; $env:KALI_USERNAME="root"
+  #   $env:DESKTOP_PORT="3002"; $env:SSH_KEY="C:/Users/thiru/Kali-Pentest-MCP/ssh-keys/id_ed25519"
+  #   node desktop-bridge-server.js
+
+networks:
+  mcp-network:
+    driver: bridge

@@ -1,0 +1,17 @@
+FROM node:20-alpine
+
+RUN apk add --no-cache openssh-client bash wget
+
+WORKDIR /app
+
+# Install dependencies from lockfile (reproducible — exact versions pinned)
+COPY package.json package-lock.json ./
+RUN npm ci --production --no-audit --no-fund
+
+COPY desktop-bridge-server.js .
+COPY start-bridge.sh /start-bridge.sh
+RUN chmod +x /start-bridge.sh
+
+EXPOSE 3002
+
+CMD ["/start-bridge.sh", "desktop-bridge-server.js"]

@@ -1,0 +1,10 @@
+.git
+agents/
+ssh-keys/
+ssh-keys.zip
+logs/
+.env
+*.md
+new 1.txt
+__pycache__
+*.pyc

@@ -1,0 +1,13 @@
+{
+  "name": "kali-mcp-bridge",
+  "version": "2.0.0",
+  "description": "MCP bridge servers for Kali Linux pentest automation",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0"
+  }
+}
