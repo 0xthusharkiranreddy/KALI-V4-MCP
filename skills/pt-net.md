@@ -234,50 +234,65 @@ nmap -sL "$SUBNET" 2>/dev/null | grep "Nmap scan report" | \
 
 ---
 
-## Phase 2 — Fast Port Scan (All 65535 Ports)
+## Phase 2 — Port Scan (Tier A: nmap on live hosts | Tier B: optional masscan full)
+
+**Tier A always runs** — nmap on discovered live hosts only, SSH-safe rate.
+**Tier B is optional** — masscan full 65535 ports per host at rate=150pps.
+⚠ Do NOT run masscan against the full /24 CIDR — it floods the kernel network stack and drops SSH.
 
 ```bash
-SUBNET=<subnet>
+IFACE=<interface>
+LOCAL_IP=<local_ip>
 ENG=/home/kali/current
 
-echo "=== [Phase 2] masscan — All Ports (1-65535) ==="
-echo "Rate: 1000 pps (adjust if on sensitive network)"
+LIVE_HOSTS=$(cat $ENG/recon/network/live_hosts.txt 2>/dev/null | head -30 | tr '\n' ' ')
+[ -z "$LIVE_HOSTS" ] && echo "[!] No live hosts found — run Phase 1 first" && exit 1
+
+echo "=== [Phase 2 — Tier A] nmap port scan on live hosts (SSH-safe) ==="
+echo "Hosts: $LIVE_HOSTS"
+echo "Rate: T3 (max-rate=300) — will NOT saturate SSH ControlMaster"
 echo ""
 
-# masscan is ~100x faster than nmap for initial port discovery
-# Include database, DevOps, and infrastructure ports explicitly
-masscan "$SUBNET" \
-    -p1-65535 \
-    --rate=1000 --open-only \
-    -oL $ENG/scans/masscan/all_ports.txt 2>/dev/null
+# Scan top-1000 ports + all our critical service ports explicitly
+# nmap T3 is safe for VirtualBox/shared adapters — unlike masscan at high pps
+nmap -sS -T3 --open -Pn \
+    --top-ports 1000 \
+    -p 21,22,23,25,53,80,110,135,139,143,443,445,554,1433,1521,1883,3306,\
+3389,5432,5900,5985,6379,8000,8080,8081,8443,8888,9090,9100,9200,11211,\
+27017,37777,8291,2375,6443,5005,4000,5672,15672,4786,8983,515,631,47808 \
+    --min-rate=100 --max-rate=300 \
+    -oL $ENG/scans/masscan/all_ports.txt \
+    $LIVE_HOSTS 2>/dev/null
 
-# Also ensure these critical service ports are explicitly targeted
-# (masscan may skip them on rate-limited runs)
-echo "--- Verifying critical service ports ---"
-for host in $(cat $ENG/recon/network/live_hosts.txt 2>/dev/null | head -30); do
-    # Database ports
-    for port in 1433 1521 3306 5432 6379 9200 27017 11211; do
-        nc -zw1 $host $port 2>/dev/null && echo "open tcp $port $host" >> $ENG/scans/masscan/all_ports.txt
-    done &
-    # DevOps/infrastructure ports
-    for port in 2375 2376 4243 6443 8080 8443 9000 5005 4000 5672 15672 8888 4848; do
-        nc -zw1 $host $port 2>/dev/null && echo "open tcp $port $host" >> $ENG/scans/masscan/all_ports.txt
-    done &
-done
-wait
-sort -u $ENG/scans/masscan/all_ports.txt -o $ENG/scans/masscan/all_ports.txt
-
-# Parse masscan output to get host:port pairs
 echo "--- Open ports discovered ---"
-grep "^open" $ENG/scans/masscan/all_ports.txt 2>/dev/null | \
-    awk '{print $4":"$3}' | sort -t: -k1,1V -k2,2n | tee $ENG/scans/masscan/open_ports_parsed.txt
+grep "^open\|Ports:" $ENG/scans/masscan/all_ports.txt 2>/dev/null | \
+    awk '/^open/{print $4":"$3}' | sort -t. -k4 -n
 
 echo ""
 echo "Port summary by host:"
-grep "^open" $ENG/scans/masscan/all_ports.txt 2>/dev/null | awk '{print $4}' | sort | uniq -c | sort -rn | while read count ip; do
-    ports=$(grep "^open.*$ip " $ENG/scans/masscan/all_ports.txt | awk '{print $3}' | sort -n | tr '\n' ',' | sed 's/,$//')
-    echo "  $ip ($count ports): $ports"
+grep "^open" $ENG/scans/masscan/all_ports.txt 2>/dev/null | \
+    awk '{print $4}' | sort | uniq -c | sort -rn | while read count ip; do
+        ports=$(grep "^open.*$ip " $ENG/scans/masscan/all_ports.txt | \
+            awk '{print $3}' | sort -n | tr '\n' ',' | sed 's/,$//')
+        echo "  $ip ($count ports open): $ports"
+    done
+
+echo ""
+echo "=== [Phase 2 — Tier B] OPTIONAL: masscan full 65535-port scan ==="
+echo "⚠ WARNING: masscan can drop SSH ControlMaster even at 150pps on VMs."
+echo "⚠ Only run this if Tier A missed ports you expect to see."
+echo "⚠ Run each host individually — NEVER masscan a /24 CIDR."
+echo ""
+echo "To run full scan on a specific host:"
+echo ""
+for host in $LIVE_HOSTS; do
+    echo "  # Full scan on $host:"
+    echo "  masscan $host -p1-65535 --rate=150 --wait=5 --open-only \\"
+    echo "      --adapter=$IFACE --adapter-ip=$LOCAL_IP \\"
+    echo "      -oL /tmp/masscan_full_${host//./_}.txt"
+    echo ""
 done
+echo "NOTE: After running, append results: cat /tmp/masscan_full_*.txt >> $ENG/scans/masscan/all_ports.txt"
 ```
 
 ---
@@ -289,11 +304,11 @@ Run nmap on live hosts discovered in Phase 1/2 for full service version detectio
 ```bash
 ENG=/home/kali/current
 
-# Get list of hosts to scan (from masscan results or arp-scan)
-HOSTS=$(grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" $ENG/scans/masscan/all_ports.txt 2>/dev/null | sort -u | head -50)
-[ -z "$HOSTS" ] && HOSTS=$(cat $ENG/recon/network/live_hosts.txt 2>/dev/null | head -50)
+# Get hosts from Phase 1 live hosts list (primary) or Phase 2 results (secondary)
+HOSTS=$(cat $ENG/recon/network/live_hosts.txt 2>/dev/null | head -50 | tr '\n' ' ')
+[ -z "$HOSTS" ] && HOSTS=$(grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" $ENG/scans/masscan/all_ports.txt 2>/dev/null | sort -u | head -50 | tr '\n' ' ')
 
-# Get open ports from masscan to tell nmap exactly what to scan (much faster)
+# Get open ports from Phase 2 scan (works with both nmap -oL and masscan -oL format)
 PORTS=$(grep "^open" $ENG/scans/masscan/all_ports.txt 2>/dev/null | awk '{print $3}' | sort -un | tr '\n' ',' | sed 's/,$//')
 [ -z "$PORTS" ] && PORTS="21,22,23,25,53,80,110,111,135,139,143,443,445,3389,5900,8080,8443,8888,9090,37777,554,161"
 
