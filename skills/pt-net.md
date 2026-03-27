@@ -63,6 +63,51 @@ cat /home/kali/current/notes/engagement.md 2>/dev/null | head -40 || echo "[no a
 
 ---
 
+## Phase 0.5 — Passive Pre-Scan (Listen Before Making Noise)
+
+Before sending a single packet, listen to the network. This reveals Windows machines broadcasting
+LLMNR, mDNS services, and SSDP devices — all without alerting any IDS:
+
+```bash
+IFACE=<interface>
+ENG=/home/kali/current
+
+echo "=== [Phase 0.5] Passive Network Listening (30 seconds) ==="
+echo "Listening for broadcasts before any active scanning..."
+echo ""
+
+# Listen for LLMNR (Windows name resolution broadcasts — reveals Windows hosts)
+echo "--- LLMNR/NBT-NS broadcasts (Windows hosts) ---"
+timeout 15 tcpdump -i "$IFACE" -nn 'udp port 5355 or udp port 137' 2>/dev/null | \
+    grep -oP '\b\d+\.\d+\.\d+\.\d+\b' | sort -u | \
+    while read ip; do echo "  [LLMNR/NBT-NS] Windows host broadcasting: $ip"; done &
+
+# Listen for mDNS (Bonjour/Avahi — reveals Apple, printers, Linux services)
+echo "--- mDNS broadcasts (Apple, printers, Linux) ---"
+timeout 15 tcpdump -i "$IFACE" -nn 'udp port 5353' 2>/dev/null | \
+    grep -oP '\b\d+\.\d+\.\d+\.\d+\b' | sort -u | \
+    while read ip; do echo "  [mDNS] Device: $ip"; done &
+
+# Listen for SSDP (UPnP devices — IoT, printers, cameras, smart TVs)
+echo "--- SSDP/UPnP broadcasts (IoT devices) ---"
+timeout 15 tcpdump -i "$IFACE" -nn 'udp port 1900' 2>/dev/null | \
+    grep -oP '\b\d+\.\d+\.\d+\.\d+\b' | sort -u | \
+    while read ip; do echo "  [UPnP/SSDP] IoT device: $ip"; done &
+
+# Listen for ARP (reveals hosts communicating right now)
+echo "--- ARP traffic (active hosts) ---"
+timeout 15 tcpdump -i "$IFACE" -nn 'arp' 2>/dev/null | \
+    grep -oP '\b\d+\.\d+\.\d+\.\d+\b' | sort -u | head -20 | \
+    while read ip; do echo "  [ARP] Active: $ip"; done &
+
+wait
+echo ""
+echo "Passive phase complete. Proceeding to active scanning."
+echo "Key insight: Windows hosts broadcasting LLMNR → strong candidate for /pt-mitm Responder"
+```
+
+---
+
 ## Phase 1 — ARP Sweep (Live Host Discovery)
 
 ARP is the most reliable discovery method on local networks — it bypasses host-based firewalls.
@@ -101,6 +146,94 @@ echo "Saved → $ENG/recon/network/live_hosts.txt ($(wc -l < $ENG/recon/network/
 
 ---
 
+## Phase 1b — Extended Discovery (UDP + NetBIOS + mDNS + IPv6)
+
+These find hosts and services that ARP + masscan completely miss:
+
+```bash
+IFACE=<interface>
+SUBNET=<subnet>
+ENG=/home/kali/current
+
+echo "=== [Phase 1b] Extended Discovery ==="
+echo ""
+
+# UDP scan for critical services (masscan only does TCP)
+echo "--- UDP scan for SNMP/DNS/TFTP/NTP/mDNS/SSDP/BACnet ---"
+HOSTS=$(cat $ENG/recon/network/live_hosts.txt 2>/dev/null | head -30 | tr '\n' ' ')
+[ -n "$HOSTS" ] && nmap -sU -T4 --open \
+    -p 53,67,68,69,123,161,162,500,514,1900,5353,47808 \
+    --version-intensity 0 \
+    -oN $ENG/scans/nmap/udp_scan.txt \
+    $HOSTS 2>/dev/null | grep "^[0-9].*open" | tee /tmp/udp_results.txt | head -30
+echo "UDP results → $ENG/scans/nmap/udp_scan.txt"
+echo ""
+
+# NetBIOS/Windows host enumeration (reveals hostnames + domain without touching SMB)
+echo "--- NetBIOS enumeration (nbtscan) ---"
+nbtscan -r "$SUBNET" 2>/dev/null | grep -v "^Doing\|^Sending\|^$" | \
+    tee $ENG/recon/network/nbtscan.txt | \
+    awk '{printf "  %-18s %-20s %-15s %s\n", $1, $2, $3, $4}' | head -30
+echo ""
+
+# mDNS/Bonjour service discovery (avahi-browse finds printers, NAS, cameras not in ARP)
+echo "--- mDNS service discovery (avahi-browse) ---"
+timeout 10 avahi-browse -a -t 2>/dev/null | \
+    grep -v "^+\|-\|^$" | sort -u | head -30 \
+    || echo "  (avahi-daemon not running — try: systemctl start avahi-daemon)"
+echo ""
+
+# Active SSDP M-SEARCH (finds IoT devices, smart TVs, routers)
+echo "--- SSDP/UPnP device discovery ---"
+python3 << 'EOF'
+import socket, time
+
+msg = ('M-SEARCH * HTTP/1.1\r\n'
+       'HOST: 239.255.255.250:1900\r\n'
+       'MAN: "ssdp:discover"\r\n'
+       'MX: 3\r\n'
+       'ST: ssdp:all\r\n\r\n')
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+s.settimeout(5)
+s.sendto(msg.encode(), ('239.255.255.250', 1900))
+
+seen = set()
+while True:
+    try:
+        data, addr = s.recvfrom(4096)
+        ip = addr[0]
+        if ip in seen: continue
+        seen.add(ip)
+        lines = data.decode(errors='replace').split('\r\n')
+        server = next((l.replace('SERVER:','').strip() for l in lines if 'SERVER:' in l.upper()), '')
+        usn = next((l.replace('USN:','').strip() for l in lines if 'USN:' in l.upper()), '')[:50]
+        print(f'  [UPnP] {ip} | {server} | {usn}')
+    except socket.timeout:
+        break
+s.close()
+EOF
+echo ""
+
+# IPv6 host discovery (modern networks often have entire IPv6 subnets invisible to IPv4 scan)
+echo "--- IPv6 host discovery ---"
+# Ping all-nodes multicast (instant — gets responses from every IPv6-capable host)
+ping6 -c 2 ff02::1%"$IFACE" 2>/dev/null | grep "from" | grep -oP '[0-9a-f:]+(?=%)' | \
+    while read ipv6; do echo "  [IPv6] $ipv6"; done
+# Also do a quick nmap IPv6 scan of link-local
+nmap -6 -sn -T4 'fe80::/10' 2>/dev/null | grep "Nmap scan report" | head -10 || true
+echo ""
+
+# Reverse DNS PTR lookup (hostnames reveal roles without port scanning)
+echo "--- Reverse DNS lookup (PTR records reveal hostnames) ---"
+nmap -sL "$SUBNET" 2>/dev/null | grep "Nmap scan report" | \
+    grep -v "not scanned" | awk '{print $5, $6}' | \
+    grep -v "^$" | head -30
+```
+
+---
+
 ## Phase 2 — Fast Port Scan (All 65535 Ports)
 
 ```bash
@@ -112,8 +245,27 @@ echo "Rate: 1000 pps (adjust if on sensitive network)"
 echo ""
 
 # masscan is ~100x faster than nmap for initial port discovery
-masscan "$SUBNET" -p1-65535 --rate=1000 --open-only \
+# Include database, DevOps, and infrastructure ports explicitly
+masscan "$SUBNET" \
+    -p1-65535 \
+    --rate=1000 --open-only \
     -oL $ENG/scans/masscan/all_ports.txt 2>/dev/null
+
+# Also ensure these critical service ports are explicitly targeted
+# (masscan may skip them on rate-limited runs)
+echo "--- Verifying critical service ports ---"
+for host in $(cat $ENG/recon/network/live_hosts.txt 2>/dev/null | head -30); do
+    # Database ports
+    for port in 1433 1521 3306 5432 6379 9200 27017 11211; do
+        nc -zw1 $host $port 2>/dev/null && echo "open tcp $port $host" >> $ENG/scans/masscan/all_ports.txt
+    done &
+    # DevOps/infrastructure ports
+    for port in 2375 2376 4243 6443 8080 8443 9000 5005 4000 5672 15672 8888 4848; do
+        nc -zw1 $host $port 2>/dev/null && echo "open tcp $port $host" >> $ENG/scans/masscan/all_ports.txt
+    done &
+done
+wait
+sort -u $ENG/scans/masscan/all_ports.txt -o $ENG/scans/masscan/all_ports.txt
 
 # Parse masscan output to get host:port pairs
 echo "--- Open ports discovered ---"
@@ -371,6 +523,92 @@ if [ -n "$SSH_HOSTS" ]; then
     nmap --script ssh2-enum-algos,ssh-auth-methods \
         -p 22 $SSH_HOSTS 2>/dev/null | grep -E "auth-methods|kex|compress|encryption|mac" | head -30
 fi
+
+# --- Active Directory / Domain Controller Detection (LDAP 389 + Kerberos 88) ---
+AD_HOSTS=$(cat $ENG/recon/network/live_hosts.txt 2>/dev/null | while read host; do
+    ldap=$(nc -zw2 $host 389 2>/dev/null && echo "y")
+    krb=$(nc -zw2 $host 88 2>/dev/null && echo "y")
+    [ -n "$ldap" ] && [ -n "$krb" ] && echo "$host"
+done | head -5)
+if [ -n "$AD_HOSTS" ]; then
+    echo ""
+    echo "--- [CRITICAL] Active Directory Domain Controller(s) Detected ---"
+    for dc in $AD_HOSTS; do
+        echo "  [DC] $dc — LDAP(389) + Kerberos(88) both open"
+        # Get AD domain name from LDAP
+        DOMAIN=$(nmap --script ldap-rootdse -p 389 "$dc" 2>/dev/null | \
+            grep -oP '(?<=defaultNamingContext: DC=)[^,]+' | head -1)
+        [ -n "$DOMAIN" ] && echo "  Domain: $DOMAIN"
+        echo "  → IMMEDIATE ACTION: /pt-ad $DOMAIN $dc"
+    done
+fi
+
+# --- Database Services (commonly unauthenticated on internal networks) ---
+echo ""
+echo "--- Database Service Detection ---"
+for host in $(cat $ENG/recon/network/live_hosts.txt 2>/dev/null | head -30); do
+    # Redis
+    nc -zw2 $host 6379 2>/dev/null && {
+        result=$(echo "PING" | nc -w2 $host 6379 2>/dev/null | head -1)
+        echo "  [REDIS] $host:6379 — Response: $result ($(echo "$result" | grep -q 'PONG' && echo 'UNAUTHENTICATED!' || echo 'auth required'))"
+    }
+    # Elasticsearch
+    nc -zw2 $host 9200 2>/dev/null && {
+        info=$(curl -sk --max-time 3 "http://$host:9200/" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('version',{}).get('number','?'))" 2>/dev/null)
+        echo "  [ELASTICSEARCH] $host:9200 — v$info (likely unauthenticated data access)"
+    }
+    # MongoDB
+    nc -zw2 $host 27017 2>/dev/null && echo "  [MONGODB] $host:27017 — open (check for unauthenticated access)"
+    # MSSQL
+    nc -zw2 $host 1433 2>/dev/null && echo "  [MSSQL] $host:1433 — open (test sa:blank, sa:sa)"
+    # MySQL
+    nc -zw2 $host 3306 2>/dev/null && echo "  [MYSQL] $host:3306 — open (test root:blank)"
+    # PostgreSQL
+    nc -zw2 $host 5432 2>/dev/null && echo "  [POSTGRES] $host:5432 — open (test postgres:blank)"
+    # memcached
+    nc -zw2 $host 11211 2>/dev/null && echo "  [MEMCACHED] $host:11211 — open (unauthenticated cache dump possible)"
+done
+
+# --- DevOps / Infrastructure Services ---
+echo ""
+echo "--- DevOps/Infrastructure Service Detection ---"
+for host in $(cat $ENG/recon/network/live_hosts.txt 2>/dev/null | head -30); do
+    # Docker API (unauthenticated = instant root on host)
+    nc -zw2 $host 2375 2>/dev/null && {
+        version=$(curl -sk --max-time 3 "http://$host:2375/version" 2>/dev/null | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Version','?'))" 2>/dev/null)
+        echo "  [DOCKER API] $host:2375 — v$version UNAUTHENTICATED (container escape to host root!)"
+    }
+    # Kubernetes API
+    nc -zw2 $host 6443 2>/dev/null && echo "  [KUBERNETES] $host:6443 — K8s API (test anon access)"
+    nc -zw2 $host 8080 2>/dev/null && {
+        title=$(curl -sk --max-time 3 "http://$host:8080/" 2>/dev/null | grep -oP '(?<=<title>)[^<]+' | head -1)
+        echo "  [HTTP:8080] $host:8080 — '$title' (check for Jenkins/Kubernetes dashboard)"
+    }
+    # Jenkins
+    nc -zw2 $host 8080 2>/dev/null && \
+        curl -sk --max-time 3 "http://$host:8080/login" 2>/dev/null | grep -qi "jenkins" && \
+        echo "  [JENKINS] $host:8080 — Jenkins! Test /script console (Groovy RCE if unauthenticated)"
+    # Java JDWP (debug wire protocol = instant RCE)
+    nc -zw2 $host 5005 2>/dev/null && echo "  [JDWP] $host:5005 — Java debug wire RCE possible"
+    nc -zw2 $host 4000 2>/dev/null && echo "  [JDWP] $host:4000 — Java debug wire RCE possible"
+    # RabbitMQ management
+    nc -zw2 $host 15672 2>/dev/null && echo "  [RABBITMQ] $host:15672 — management UI (default: guest/guest)"
+done
+
+# --- Full Windows Enumeration (enum4linux-ng for any Windows host) ---
+WIN_HOSTS=$(grep "microsoft-ds\|445.*open" $ENG/scans/nmap/service_scan.txt 2>/dev/null | \
+    grep -oP '\b\d+\.\d+\.\d+\.\d+\b' | sort -u | head -5)
+if [ -n "$WIN_HOSTS" ]; then
+    echo ""
+    echo "--- enum4linux-ng (full Windows/Samba enumeration) ---"
+    for host in $WIN_HOSTS; do
+        echo "  Enumerating $host..."
+        enum4linux-ng -A "$host" 2>/dev/null | \
+            grep -E "Domain|Workgroup|SID|User|Group|Share|Policy|Password" | \
+            head -30 | tee $ENG/recon/network/enum4linux_${host}.txt | sed 's/^/  /'
+    done
+fi
 ```
 
 ---
@@ -453,6 +691,48 @@ iw dev 2>/dev/null | grep -q "Interface" && \
     echo "  [HIGH] WiFi interface present on Kali"
     echo "    → Survey all nearby WiFi networks: /pt-wifi <wlan-interface>"
     echo "    → WPA2 handshake capture + PMKID + crack"
+    echo ""
+
+grep -q "6379.*open\|redis" $ENG/scans/nmap/service_scan.txt 2>/dev/null && \
+    echo "  [CRITICAL] Redis port 6379 open"
+    echo "    → Unauthenticated RCE via SSH key or crontab injection: /pt-exploit <host> redis:6379"
+    echo ""
+
+grep -q "9200.*open\|elasticsearch" $ENG/scans/nmap/service_scan.txt 2>/dev/null && \
+    echo "  [HIGH] Elasticsearch port 9200 open"
+    echo "    → Full data dump + possible Groovy script RCE: /pt-exploit <host> elasticsearch:9200"
+    echo ""
+
+grep -q "27017.*open\|mongodb" $ENG/scans/nmap/service_scan.txt 2>/dev/null && \
+    echo "  [HIGH] MongoDB port 27017 open"
+    echo "    → Unauthenticated database dump: /pt-exploit <host> mongodb:27017"
+    echo ""
+
+grep -q "2375.*open" $ENG/scans/nmap/service_scan.txt 2>/dev/null && \
+    echo "  [CRITICAL] Docker API port 2375 open (UNAUTHENTICATED)"
+    echo "    → Container escape → host root access: /pt-exploit <host> docker:2375"
+    echo ""
+
+grep -q "6443.*open\|8080.*kubernetes\|kube" $ENG/scans/nmap/service_scan.txt 2>/dev/null && \
+    echo "  [CRITICAL] Kubernetes API detected"
+    echo "    → Cluster takeover + privileged container escape: /pt-exploit <host> kubernetes:6443"
+    echo ""
+
+grep -q "8080.*open" $ENG/scans/nmap/service_scan.txt 2>/dev/null && \
+    curl -sk --max-time 3 "http://$(grep "8080.*open" $ENG/scans/nmap/service_scan.txt | grep -oP '\b\d+\.\d+\.\d+\.\d+\b' | head -1):8080/login" 2>/dev/null | grep -qi "jenkins" && \
+    echo "  [CRITICAL] Jenkins detected on port 8080"
+    echo "    → Groovy script console RCE (if unauthenticated): /pt-exploit <host> jenkins:8080"
+    echo ""
+
+grep -q "5005.*open\|4000.*jdwp\|jdwp" $ENG/scans/nmap/service_scan.txt 2>/dev/null && \
+    echo "  [CRITICAL] Java JDWP debug port open"
+    echo "    → Remote class loading = instant RCE: /pt-exploit <host> jdwp:5005"
+    echo ""
+
+[ -n "$(cat $ENG/recon/network/live_hosts.txt 2>/dev/null)" ] && \
+    grep -q "389.*open\|88.*kerberos" $ENG/scans/nmap/service_scan.txt 2>/dev/null && \
+    echo "  [CRITICAL] Active Directory Domain Controller detected (LDAP+Kerberos)"
+    echo "    → Full AD attack chain: /pt-ad <domain> <dc-ip>"
     echo ""
 
 echo "  [ALWAYS APPLICABLE] ARP MITM position (any live hosts = MITM possible)"

