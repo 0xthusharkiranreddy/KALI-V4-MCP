@@ -17,15 +17,10 @@ COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "3600000")) / 1000
 TOOLS = [
     {
         "name": "desktop_screenshot",
-        "description": "Take a screenshot of the Kali VM desktop and return it as an image. Always call this to see the current state before deciding where to click.",
+        "description": "Take a screenshot of the Kali VM desktop (1920×955) and return it as an image. Always call this before clicking to verify coordinates.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "region": {
-                    "type": "string",
-                    "description": "Optional: capture a specific region as 'x,y,width,height', e.g. '100,200,800,600'. Omit for full screen."
-                }
-            }
+            "properties": {}
         }
     },
     {
@@ -175,6 +170,26 @@ TOOLS = [
         }
     },
 
+    {
+        "name": "desktop_find",
+        "description": (
+            "Find a UI element on the Kali desktop by natural language description and return its (x, y) coordinates. "
+            "Takes a screenshot automatically then uses AI vision to locate the element. "
+            "Examples: 'the Submit button', 'the password field', 'the Burp Intercept tab', 'the Firefox address bar'. "
+            "Requires ANTHROPIC_API_KEY env var. Returns {found, x, y} or {found: false, reason}."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "Natural language description of what to find, e.g. 'the login button'"
+                }
+            },
+            "required": ["description"]
+        }
+    },
+
     # ── Perception / browser tools ────────────────────────────────────────────
     {
         "name": "browser_navigate",
@@ -291,6 +306,29 @@ TOOLS = [
         }
     },
     {
+        "name": "browser_wait_for",
+        "description": (
+            "Wait for a URL pattern or CSS selector to appear in the Playwright browser, then return page state. "
+            "Use after browser_click to wait for navigation instead of manually polling browser_get_state. "
+            "condition: URL pattern (e.g. 'https://example.com/dashboard') or CSS selector (e.g. '#welcome-msg'). "
+            "Returns updated structured page state when condition is met, or error on timeout."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "condition": {
+                    "type": "string",
+                    "description": "URL pattern (starts with http) or CSS selector to wait for"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max seconds to wait (default: 10)"
+                }
+            },
+            "required": ["condition"]
+        }
+    },
+    {
         "name": "browser_close",
         "description": "Close the persistent Playwright browser. Next browser_navigate call will open a fresh one.",
         "inputSchema": {
@@ -300,8 +338,76 @@ TOOLS = [
     }
 ]
 
-SERVER_INFO = {"name": "kali-desktop-bridge", "version": "2.0.0"}
+SERVER_INFO = {"name": "kali-desktop-bridge", "version": "2.1.0"}
 _handle_base = make_base_handler(SERVER_INFO, TOOLS)
+
+
+def _desktop_find(description: str) -> dict:
+    """
+    Take a screenshot and use Claude Haiku vision to locate a UI element by description.
+    Returns {found, x, y, description} or {found, reason}.
+    Requires ANTHROPIC_API_KEY env var.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {
+            "found": False,
+            "reason": "ANTHROPIC_API_KEY not set. Set it in your environment to enable AI element finding."
+        }
+
+    # Take a screenshot via the bridge
+    try:
+        resp = requests.post(BRIDGE_URL, json={"tool_name": "desktop_screenshot", "arguments": {}},
+                             timeout=(5, 30))
+        data = resp.json()
+        if not data.get("success") or not data.get("data"):
+            return {"found": False, "reason": f"Screenshot failed: {data.get('error', 'no image returned')}"}
+        b64_image = data["data"]
+    except Exception as e:
+        return {"found": False, "reason": f"Screenshot error: {e}"}
+
+    # Call Claude Haiku with the screenshot
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": b64_image}
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            f'Screen is 1920x955 pixels. Find: "{description}"\n\n'
+                            "Reply with ONLY one of:\n"
+                            "  FOUND x=<integer> y=<integer>\n"
+                            "  NOT_FOUND <brief reason>\n\n"
+                            "Use the center of the element. No other text."
+                        )
+                    }
+                ]
+            }]
+        )
+        text = response.content[0].text.strip()
+    except ImportError:
+        return {"found": False, "reason": "anthropic package not installed. Run: pip install anthropic"}
+    except Exception as e:
+        return {"found": False, "reason": f"Claude API error: {e}"}
+
+    if text.startswith("FOUND"):
+        import re
+        m = re.search(r'x=(\d+)\s+y=(\d+)', text)
+        if m:
+            return {"found": True, "x": int(m.group(1)), "y": int(m.group(2)), "description": description}
+        return {"found": False, "reason": f"Could not parse coordinates from: {text}"}
+
+    reason = text.replace("NOT_FOUND", "").strip() or "Element not visible on screen"
+    return {"found": False, "reason": reason}
 
 
 def _safe_args(args):
@@ -380,6 +486,17 @@ def handle_message(line):
         arguments = params.get("arguments", {})
         log(f"Calling {tool_name} args={_safe_args(arguments)}")
         try:
+            # desktop_find is handled locally (calls Claude API + bridge screenshot)
+            if tool_name == "desktop_find":
+                description = arguments.get("description", "").strip()
+                if not description:
+                    send_response(req_id, error={"code": -32602, "message": "Missing 'description'"})
+                    return
+                result_dict = _desktop_find(description)
+                import json as _json
+                send_response(req_id, {"content": [{"type": "text", "text": _json.dumps(result_dict, indent=2)}]})
+                return
+
             result = call_tool(tool_name, arguments)
             send_response(req_id, result)
         except Exception as e:

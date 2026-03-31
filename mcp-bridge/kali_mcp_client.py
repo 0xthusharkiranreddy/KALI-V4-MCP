@@ -24,9 +24,11 @@ import pathlib
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor as _TPE
 
 from mcp_base import log, send_response, make_base_handler, run_stdio_loop
 
@@ -34,7 +36,7 @@ from mcp_base import log, send_response, make_base_handler, run_stdio_loop
 KALI_HOST        = os.environ.get("KALI_HOST", "192.168.1.202")
 KALI_PORT        = os.environ.get("KALI_PORT", "22")
 KALI_USER        = os.environ.get("KALI_USER", "root")
-SSH_KEY          = os.environ.get("SSH_KEY", r"C:\Users\thiru\Kali-Pentest-MCP\ssh-keys\id_ed25519")
+SSH_KEY          = os.environ.get("SSH_KEY", r"C:\Users\thiru\KALI-V4-MCP\mcp-bridge\ssh-keys\id_ed25519")
 COMMAND_TIMEOUT  = int(os.environ.get("COMMAND_TIMEOUT", str(86400)))
 MAX_OUTPUT_BYTES = int(os.environ.get("MCP_MAX_OUTPUT_MB", "8")) * 1024 * 1024
 JOB_DIR          = "/tmp/mcp_jobs"  # on Kali
@@ -62,7 +64,25 @@ def _find_ssh() -> str:
     return "ssh"
 
 SSH_EXE = _find_ssh()
-SCP_EXE = SSH_EXE.replace("ssh.exe", "scp.exe")  # same package, same ControlMaster support
+
+
+def _find_scp() -> str:
+    """Find scp.exe from the same package as SSH_EXE (Git Bash preferred)."""
+    for p in [
+        r"C:\Program Files\Git\usr\bin\scp.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\scp.exe",
+        r"C:\Windows\System32\OpenSSH\scp.exe",
+    ]:
+        if os.path.exists(p):
+            return p
+    if "ssh.exe" in SSH_EXE:
+        candidate = SSH_EXE.replace("ssh.exe", "scp.exe")
+        if os.path.exists(candidate):
+            return candidate
+    return "scp"
+
+
+SCP_EXE = _find_scp()
 
 
 # ── Target registry ──────────────────────────────────────────────────────────
@@ -548,6 +568,17 @@ def _get_output(job_id: str) -> dict:
         output = raw
         status = "unknown"
 
+    # Truncate large job output (same cap as sync commands)
+    output_bytes = output.encode("utf-8", errors="replace")
+    if len(output_bytes) > MAX_OUTPUT_BYTES:
+        output = output_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+        output = output.rsplit("\n", 1)[0]
+        mb = MAX_OUTPUT_BYTES // 1024 // 1024
+        output += (
+            f"\n\n[OUTPUT TRUNCATED — exceeded {mb}MB limit. "
+            f"Read directly: cat {job['out_file']} | tail -500]"
+        )
+
     with _jobs_lock:
         if status in ("done", "unknown"):
             _jobs[job_id]["status"] = "done"
@@ -586,6 +617,58 @@ def _kill_job(job_id: str) -> str:
         _jobs[job_id]["status"] = "killed"
         _save_jobs(_jobs)
     return out.strip() or f"Kill signal sent to job {job_id}"
+
+
+def _clear_jobs(status_filter: str = None) -> str:
+    """Remove non-running jobs from registry. status_filter=None clears all done/killed/error."""
+    with _jobs_lock:
+        if status_filter:
+            to_remove = [jid for jid, j in _jobs.items() if j.get("status") == status_filter]
+        else:
+            to_remove = [jid for jid, j in _jobs.items() if j.get("status") != "running"]
+        for jid in to_remove:
+            del _jobs[jid]
+        _save_jobs(_jobs)
+    return f"Cleared {len(to_remove)} job(s) from registry. {len(_jobs)} job(s) remain."
+
+
+def _kill_all_jobs() -> str:
+    """Kill every job currently marked as running."""
+    with _jobs_lock:
+        running = [j for j in _jobs.values() if j.get("status") == "running"]
+    if not running:
+        return "No running jobs to kill."
+    results = []
+    for job in running:
+        msg = _kill_job(job["job_id"])
+        results.append(f"  [{job['job_id']}] {msg}")
+    return f"Killed {len(results)} running job(s):\n" + "\n".join(results)
+
+
+def _wait_for_job(job_id: str, timeout: int = 300, poll_interval: int = 5,
+                  stop_on: list = None) -> dict:
+    """Poll a job until done, keyword found, or timeout. Returns _get_output() dict + stop_reason."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = _get_output(job_id)
+        if "error" in result:
+            return result
+        output  = result.get("output", "")
+        status  = result.get("status", "unknown")
+        if stop_on:
+            for kw in stop_on:
+                if kw.lower() in output.lower():
+                    result["stop_reason"] = f"keyword '{kw}' found"
+                    return result
+        if status in ("done", "killed"):
+            result["stop_reason"] = f"job {status}"
+            return result
+        remaining = int(deadline - time.time())
+        log(f"wait_for_job {job_id}: {status}, {remaining}s remaining")
+        time.sleep(poll_interval)
+    result = _get_output(job_id)
+    result["stop_reason"] = f"timeout after {timeout}s"
+    return result
 
 
 def _list_jobs() -> str:
@@ -797,6 +880,60 @@ TOOLS = [
                 }
             },
             "required": ["direction", "local_path", "remote_path"]
+        }
+    },
+    {
+        "name": "get_engagement_summary",
+        "description": (
+            "Returns current engagement status: notes from engagement.md + running Kali jobs + last 20 audit entries. "
+            "Run at the start of each session to instantly pick up context from previous sessions."
+        ),
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "clear_jobs",
+        "description": (
+            "Remove completed, killed, or errored jobs from the job registry to keep list_jobs clean. "
+            "Running jobs are never removed. Omit status to clear all non-running jobs."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["done", "killed", "error"],
+                    "description": "Only clear jobs with this status. Omit to clear all non-running."
+                }
+            }
+        }
+    },
+    {
+        "name": "kill_all_jobs",
+        "description": (
+            "Emergency stop — kill every currently running background job on all targets. "
+            "Use when you need to immediately halt all active scans."
+        ),
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "wait_for_job",
+        "description": (
+            "Block until a background job completes, a keyword appears in its output, or a timeout expires. "
+            "Eliminates manual polling loops. Use stop_on=['password found','open port'] for early returns."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Job ID from execute_kali_command or list_jobs"},
+                "timeout": {"type": "integer", "description": "Max seconds to wait (default: 300)"},
+                "poll_interval": {"type": "integer", "description": "Seconds between polls (default: 5)"},
+                "stop_on": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Return early if any of these strings appear in output (case-insensitive)"
+                }
+            },
+            "required": ["job_id"]
         }
     },
     {
@@ -1030,34 +1167,26 @@ def handle_message(line: str):
                 send_response(req_id, error={"code": -32602, "message": "commands list is empty"})
                 return
 
-            results = []
-            for item in commands:
+            def _launch_one(item):
                 cmd = item.get("command", "").strip()
                 if not cmd:
-                    continue
+                    return None
                 target_name = item.get("target") or "default"
                 label       = item.get("label") or (cmd[:40] + "..." if len(cmd) > 40 else cmd)
                 tgt         = _resolve_target(target_name)
                 try:
                     job_id = _start_job(cmd, target_name, tgt)
-                    results.append({
-                        "job_id":  job_id,
-                        "label":   label,
-                        "target":  target_name,
-                        "status":  "running",
-                    })
                     _audit_append("execute_kali_command",
                                   {"command": cmd, "async": True},
                                   target=target_name,
                                   result_summary=f"parallel job {job_id}",
                                   rc=0, job_id=job_id)
+                    return {"job_id": job_id, "label": label, "target": target_name, "status": "running"}
                 except Exception as e:
-                    results.append({
-                        "job_id":  None,
-                        "label":   label,
-                        "target":  target_name,
-                        "status":  f"error: {e}",
-                    })
+                    return {"job_id": None, "label": label, "target": target_name, "status": f"error: {e}"}
+
+            with _TPE(max_workers=len(commands)) as ex:
+                results = [r for r in ex.map(_launch_one, commands) if r is not None]
 
             lines = [f"Launched {len(results)} parallel job(s):\n"]
             for r in results:
@@ -1067,6 +1196,59 @@ def handle_message(line: str):
                 )
             lines.append("\nPoll each with: get_job_output(job_id='<id>')")
             text = "\n".join(lines)
+            send_response(req_id, {"content": [{"type": "text", "text": text}]})
+
+        # ── get_engagement_summary ────────────────────────────────────────
+        elif tool == "get_engagement_summary":
+            target = _resolve_target("default")
+            notes_cmd = (
+                "echo '=== ENGAGEMENT NOTES ==='; "
+                "cat /home/kali/current/notes/engagement.md 2>/dev/null "
+                "  || echo '(no active engagement — run /pt-init <name> <target> first)'; "
+                "echo; echo '=== RUNNING JOBS ON KALI ==='; "
+                "ls /tmp/mcp_jobs/*.pid 2>/dev/null | while read f; do "
+                "  pid=$(cat \"$f\" 2>/dev/null); jid=$(basename \"$f\" .pid); "
+                "  kill -0 \"$pid\" 2>/dev/null && echo \"  $jid  PID=$pid\"; "
+                "done; echo '(done)'"
+            )
+            rc, notes = _pool.run(notes_cmd, target, timeout=15)
+            audit_section = _audit_read(limit=20)
+            text = notes + "\n\n=== RECENT AUDIT LOG (last 20) ===\n" + audit_section
+            send_response(req_id, {"content": [{"type": "text", "text": text}]})
+
+        # ── clear_jobs ────────────────────────────────────────────────────
+        elif tool == "clear_jobs":
+            text = _clear_jobs(args.get("status") or None)
+            send_response(req_id, {"content": [{"type": "text", "text": text}]})
+
+        # ── kill_all_jobs ─────────────────────────────────────────────────
+        elif tool == "kill_all_jobs":
+            text = _kill_all_jobs()
+            _audit_append(tool, {}, result_summary=text[:200], rc=0)
+            send_response(req_id, {"content": [{"type": "text", "text": text}]})
+
+        # ── wait_for_job ──────────────────────────────────────────────────
+        elif tool == "wait_for_job":
+            job_id = args.get("job_id", "").strip()
+            if not job_id:
+                send_response(req_id, error={"code": -32602, "message": "Missing 'job_id'"})
+                return
+            timeout       = int(args.get("timeout", 300))
+            poll_interval = int(args.get("poll_interval", 5))
+            stop_on       = args.get("stop_on") or []
+            result        = _wait_for_job(job_id, timeout=timeout,
+                                          poll_interval=poll_interval, stop_on=stop_on)
+            if "error" in result:
+                send_response(req_id, error={"code": -32000, "message": result["error"]})
+                return
+            elapsed     = _fmt_elapsed(result["elapsed"])
+            tgt         = result.get("target", "default")
+            stop_reason = result.get("stop_reason", "")
+            text = (
+                f"Job {result['job_id']} [{result['status']}] ({elapsed} elapsed) [{tgt}]\n"
+                f"Stop reason: {stop_reason}\n\n"
+                f"{result['output']}"
+            )
             send_response(req_id, {"content": [{"type": "text", "text": text}]})
 
         # ── audit_log ─────────────────────────────────────────────────────

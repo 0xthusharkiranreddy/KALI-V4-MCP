@@ -8,7 +8,7 @@
 ```
 Claude Code (Windows)
     ↓ stdio
-kali_mcp_client.py  (C:\Users\thiru\Kali-Pentest-MCP\kali_mcp_client.py)
+kali_mcp_client.py  (C:\Users\thiru\KALI-V4-MCP\mcp-bridge\kali_mcp_client.py)
     ↓ SSH ControlMaster pool (one persistent master process per target)
 Kali Linux VirtualBox VM  (root@192.168.1.202)
     [+ optional extra targets via KALI_TARGETS env var]
@@ -20,7 +20,7 @@ Kali Linux VirtualBox VM  (root@192.168.1.202)
 ```
 Claude Code (Windows)
     ↓ stdio
-kali_desktop_client.py  (C:\Users\thiru\Kali-Pentest-MCP\kali_desktop_client.py)
+kali_desktop_client.py  (C:\Users\thiru\KALI-V4-MCP\mcp-bridge\kali_desktop_client.py)
     ↓ HTTP POST to localhost:3002
 desktop-bridge-server.js  (Windows-native Node.js process, port 3002 — NOT Docker)
     ↓ VBoxManage screenshotpng → screenshots (zero X11, no display freeze)
@@ -55,15 +55,15 @@ Playwright Chromium on Kali  (headless — structured page state, network captur
 
 | File | Path |
 |------|------|
-| MCP bridge repo | `C:\Users\thiru\Kali-Pentest-MCP\` |
-| CLI MCP client | `C:\Users\thiru\Kali-Pentest-MCP\kali_mcp_client.py` |
-| Desktop MCP client | `C:\Users\thiru\Kali-Pentest-MCP\kali_desktop_client.py` |
-| Shared MCP base | `C:\Users\thiru\Kali-Pentest-MCP\mcp_base.py` |
-| CLI bridge server | `C:\Users\thiru\Kali-Pentest-MCP\bridge-server.js` (port 3001) |
-| Desktop bridge server | `C:\Users\thiru\Kali-Pentest-MCP\desktop-bridge-server.js` (port 3002) |
-| SSH pool init script | `C:\Users\thiru\Kali-Pentest-MCP\start-bridge.sh` (runs inside mcp-bridge container) |
-| SSH key | `C:\Users\thiru\Kali-Pentest-MCP\ssh-keys\id_ed25519` |
-| Env config | `C:\Users\thiru\Kali-Pentest-MCP\.env` |
+| MCP bridge repo | `C:\Users\thiru\KALI-V4-MCP\mcp-bridge\` |
+| CLI MCP client | `C:\Users\thiru\KALI-V4-MCP\mcp-bridge\kali_mcp_client.py` |
+| Desktop MCP client | `C:\Users\thiru\KALI-V4-MCP\mcp-bridge\kali_desktop_client.py` |
+| Shared MCP base | `C:\Users\thiru\KALI-V4-MCP\mcp-bridge\mcp_base.py` |
+| CLI bridge server | `C:\Users\thiru\KALI-V4-MCP\mcp-bridge\bridge-server.js` (port 3001) |
+| Desktop bridge server | `C:\Users\thiru\KALI-V4-MCP\mcp-bridge\desktop-bridge-server.js` (port 3002) |
+| SSH pool init script | `C:\Users\thiru\KALI-V4-MCP\mcp-bridge\start-bridge.sh` (runs inside mcp-bridge container) |
+| SSH key | `C:\Users\thiru\KALI-V4-MCP\mcp-bridge\ssh-keys\id_ed25519` |
+| Env config | `C:\Users\thiru\KALI-V4-MCP\mcp-bridge\.env` |
 | Perception server | `/home/kali/perception-server.py` (on Kali VM) |
 | Slash commands | `C:\Users\thiru\.claude\commands\` |
 
@@ -96,9 +96,9 @@ $env:KALI_HOST="192.168.1.202"
 $env:KALI_PORT="22"
 $env:KALI_USERNAME="root"
 $env:DESKTOP_PORT="3002"
-$env:SSH_KEY="C:/Users/thiru/Kali-Pentest-MCP/ssh-keys/id_ed25519"
+$env:SSH_KEY="C:/Users/thiru/KALI-V4-MCP/mcp-bridge/ssh-keys/id_ed25519"
 $env:VBOX_VM="kali-linux-2025.4-virtualbox-amd64"
-cd C:\Users\thiru\Kali-Pentest-MCP
+cd C:\Users\thiru\KALI-V4-MCP\mcp-bridge
 node desktop-bridge-server.js
 ```
 

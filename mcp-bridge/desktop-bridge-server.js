@@ -29,43 +29,76 @@ function getSocketPath() {
   return `/tmp/ssh_mux_${process.env.KALI_HOST}_${idx}`;
 }
 
-async function executeKaliCommand(command) {
+// Evict a stale ControlMaster socket (same fix as CLI bridge Change 7)
+async function evictSocket(socketPath) {
+  return new Promise((resolve) => {
+    const sshKey = process.env.SSH_KEY || 'C:/Users/thiru/KALI-V4-MCP/mcp-bridge/ssh-keys/id_ed25519';
+    const exitCmd = `ssh -i "${sshKey}" -o ControlPath=${socketPath} -o BatchMode=yes -O exit ${process.env.KALI_USERNAME}@${process.env.KALI_HOST}`;
+    const proc = spawn('sh', ['-c', exitCmd]);
+    proc.on('close', () => {
+      // Force-remove the socket file regardless of ssh -O exit result
+      try { require('fs').unlinkSync(socketPath); } catch (_) {}
+      resolve();
+    });
+    proc.on('error', () => resolve());
+    setTimeout(() => { try { proc.kill(); } catch (_) {} resolve(); }, 2000);
+  });
+}
+
+// Single SSH attempt — returns { stdout, stderr, code }
+async function _sshOnce(command, socketPath) {
   return new Promise((resolve, reject) => {
-    const socketPath = getSocketPath();
     const b64cmd = Buffer.from(command).toString('base64');
-    const sshKey = process.env.SSH_KEY || '/root/.ssh/id_ed25519';
+    const sshKey = process.env.SSH_KEY || 'C:/Users/thiru/KALI-V4-MCP/mcp-bridge/ssh-keys/id_ed25519';
     const sshCmd =
       `ssh -i "${sshKey}" -p ${KALI_PORT} ` +
       `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ` +
+      `-o BatchMode=yes -o LogLevel=ERROR ` +
       `-o ControlMaster=auto -o ControlPath=${socketPath} -o ControlPersist=1h ` +
       `${process.env.KALI_USERNAME}@${process.env.KALI_HOST} ` +
       `'bash -c "$(echo ${b64cmd} | base64 -d)"'`;
 
-    // Direct SSH — no docker exec relay
-    const dockerExec = spawn('sh', ['-c', sshCmd]);
-
+    const proc = spawn('sh', ['-c', sshCmd]);
     let stdoutChunks = [];
     let stderr = '';
 
     const timer = setTimeout(() => {
-      dockerExec.kill();
+      proc.kill();
       reject(new Error(`Command timed out after ${COMMAND_TIMEOUT / 1000}s`));
     }, COMMAND_TIMEOUT);
 
-    dockerExec.stdout.on('data', (data) => { stdoutChunks.push(data); });
-    dockerExec.stderr.on('data', (data) => { stderr += data.toString(); });
-
-    dockerExec.on('close', (code) => {
-      clearTimeout(timer);
-      const stdout = Buffer.concat(stdoutChunks);
-      resolve({ stdout, stderr, code });
-    });
-
-    dockerExec.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
+    proc.stdout.on('data', (d) => stdoutChunks.push(d));
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('close', (code) => { clearTimeout(timer); resolve({ stdout: Buffer.concat(stdoutChunks), stderr, code }); });
+    proc.on('error', (err) => { clearTimeout(timer); reject(err); });
   });
+}
+
+// executeKaliCommand with 3x retry + zombie socket eviction on rc=255
+async function executeKaliCommand(command) {
+  const MAX_ATTEMPTS = 3;
+  let lastErr;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const socketPath = getSocketPath();
+    if (attempt > 0) {
+      log('warn', 'desktop_ssh_retry', { attempt, socketPath });
+      await evictSocket(socketPath);
+      await new Promise(r => setTimeout(r, 1000 * attempt));
+    }
+    try {
+      const result = await _sshOnce(command, socketPath);
+      if (result.code === 255 && attempt < MAX_ATTEMPTS - 1) {
+        lastErr = new Error(`SSH exit 255 on attempt ${attempt + 1}`);
+        await evictSocket(socketPath);
+        continue;
+      }
+      return result;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < MAX_ATTEMPTS - 1) continue;
+    }
+  }
+  throw lastErr || new Error('SSH command failed after 3 attempts');
 }
 
 // ─── VBoxManage screenshot (zero X11 involvement — no display freeze) ─────────
@@ -94,43 +127,38 @@ async function takeVBoxScreenshot(region) {
 // ─── Perception server helpers ────────────────────────────────────────────────
 
 let perceptionReady = false;
-let perceptionStarting = false;
+let _perceptionStartPromise = null;  // single in-flight start promise — prevents concurrent launches
+
+async function _doStartPerception() {
+  const check = await executeKaliCommand(
+    `curl -sf -m 5 http://localhost:${PERCEPTION_PORT}/health && echo ok`
+  );
+  if (check.stdout.toString().includes('ok')) {
+    perceptionReady = true;
+    return;
+  }
+  // Not running — start it and verify it actually responds (up to 30s)
+  await executeKaliCommand(
+    `nohup /opt/perception-venv/bin/python3 /home/kali/perception-server.py > /tmp/perception.log 2>&1 &`
+  );
+  const verify = await executeKaliCommand(
+    `for i in 1 2 3 4 5 6 7 8 9 10; do curl -sf -m 3 http://localhost:${PERCEPTION_PORT}/health && echo ok && break || sleep 3; done`
+  );
+  if (!verify.stdout.toString().includes('ok')) {
+    throw new Error('Perception server failed to start — check /tmp/perception.log on Kali');
+  }
+  perceptionReady = true;
+}
 
 async function ensurePerceptionServer() {
   if (perceptionReady) return;
-
-  if (perceptionStarting) {
-    // Another call is already starting the server — wait up to 10s
-    const deadline = Date.now() + 10000;
-    while (perceptionStarting && Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 200));
-    }
-    return;
+  // All concurrent calls share the same promise — only one SSH launch happens
+  if (!_perceptionStartPromise) {
+    _perceptionStartPromise = _doStartPerception().finally(() => {
+      _perceptionStartPromise = null;  // allow retry if it failed
+    });
   }
-
-  perceptionStarting = true;
-  try {
-    const check = await executeKaliCommand(
-      `curl -sf -m 5 http://localhost:${PERCEPTION_PORT}/health && echo ok`
-    );
-    if (check.stdout.toString().includes('ok')) {
-      perceptionReady = true;
-      return;
-    }
-    // Not running — start it and verify it actually responds (up to 15s)
-    await executeKaliCommand(
-      `nohup /opt/perception-venv/bin/python3 /home/kali/perception-server.py > /tmp/perception.log 2>&1 &`
-    );
-    const verify = await executeKaliCommand(
-      `for i in 1 2 3 4 5; do curl -sf -m 5 http://localhost:${PERCEPTION_PORT}/health && echo ok && break || sleep 3; done`
-    );
-    if (!verify.stdout.toString().includes('ok')) {
-      throw new Error('Perception server failed to start — check /tmp/perception.log on Kali');
-    }
-    perceptionReady = true;
-  } finally {
-    perceptionStarting = false;
-  }
+  await _perceptionStartPromise;
 }
 
 async function perceptionCall(method, endpoint, body) {
@@ -144,10 +172,15 @@ async function perceptionCall(method, endpoint, body) {
   }
   const result = await executeKaliCommand(cmd);
   const text = result.stdout.toString('utf8').trim();
-  if (!text) throw new Error(`Perception server returned empty response. stderr: ${result.stderr}`);
+  if (!text) {
+    // Server may have crashed — reset so next call triggers auto-restart
+    perceptionReady = false;
+    throw new Error(`Perception server returned empty response (may have crashed). stderr: ${result.stderr}. Will auto-restart on next call.`);
+  }
   try {
     return JSON.parse(text);
   } catch (e) {
+    perceptionReady = false;  // malformed response = treat as crashed
     throw new Error(`Perception server returned invalid JSON: ${text.slice(0, 200)}`);
   }
 }
@@ -163,7 +196,6 @@ app.post('/v1/tools/execute', async (req, res) => {
 
   try {
     let command = '';
-    let isScreenshot = false;
 
     switch (tool_name) {
 
@@ -322,6 +354,20 @@ app.post('/v1/tools/execute', async (req, res) => {
         return;
       }
 
+      case 'browser_wait_for': {
+        if (!args.condition) {
+          return res.status(400).json({ error: 'browser_wait_for requires condition (URL pattern or CSS selector)' });
+        }
+        const state = await perceptionCall('POST', '/wait', {
+          condition: args.condition,
+          timeout: args.timeout || 10,
+        });
+        const screenshot = state.screenshot || null;
+        delete state.screenshot;
+        res.json({ success: true, isBrowser: true, result: JSON.stringify(state, null, 2), screenshot });
+        return;
+      }
+
       case 'browser_close': {
         const data = await perceptionCall('POST', '/close', {});
         // Reset ready flag so next call restarts the server
@@ -335,17 +381,8 @@ app.post('/v1/tools/execute', async (req, res) => {
     }
 
     const result = await executeKaliCommand(command);
-
-    if (isScreenshot) {
-      const base64 = result.stdout.toString('utf8').trim();
-      if (!base64.startsWith('iVBORw0KGgo')) {
-        return res.json({ success: false, error: `Screenshot failed: ${result.stderr || 'invalid PNG'}` });
-      }
-      res.json({ success: true, isImage: true, data: base64, mimeType: 'image/png' });
-    } else {
-      const text = (result.stdout.toString('utf8') + result.stderr).trim() || `exit: ${result.code}`;
-      res.json({ success: true, result: text });
-    }
+    const text = (result.stdout.toString('utf8') + result.stderr).trim() || `exit: ${result.code}`;
+    res.json({ success: true, result: text });
 
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
